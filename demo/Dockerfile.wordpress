@@ -1,0 +1,137 @@
+FROM ubuntu:24.04
+
+ARG NGINX_VERSION=1.30.1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpcre2-dev \
+    libpcre3-dev \
+    zlib1g-dev \
+    libssl-dev \
+    wget \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download nginx source
+RUN wget -q https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz \
+    && tar xzf nginx-${NGINX_VERSION}.tar.gz \
+    && rm nginx-${NGINX_VERSION}.tar.gz
+
+# Copy module source
+COPY *.c *.h config /module/
+
+# Build nginx with module
+RUN cd /nginx-${NGINX_VERSION} \
+    && ./configure \
+        --with-compat \
+        --with-http_ssl_module \
+        --with-http_realip_module \
+        --add-dynamic-module=/module \
+    && make -j$(nproc) modules \
+    && make -j$(nproc) \
+    && make install
+
+# Install module
+RUN mkdir -p /usr/local/nginx/modules \
+    && cp /nginx-${NGINX_VERSION}/objs/ngx_http_lscache_module.so \
+          /usr/local/nginx/modules/
+
+# Cache root, owned by the worker user
+RUN mkdir -p /var/cache/nginx/lscache/data \
+             /var/cache/nginx/lscache/tags \
+             /var/cache/nginx/lscache/hosts \
+             /var/cache/nginx/lscache/vary \
+             /var/cache/nginx/lscache/tmp \
+    && chown -R nobody:nogroup /var/cache/nginx/lscache
+
+# WordPress-friendly nginx config that loads the lscache module
+RUN cat > /usr/local/nginx/conf/nginx.conf << 'EOF'
+load_module modules/ngx_http_lscache_module.so;
+
+user nobody nogroup;
+worker_processes auto;
+error_log /dev/stderr info;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include       mime.types;
+    default_type  application/octet-stream;
+    access_log    /dev/stdout;
+
+    sendfile             on;
+    keepalive_timeout    65;
+    client_max_body_size 64m;
+
+    gzip on;
+    gzip_comp_level 5;
+    gzip_min_length 256;
+    gzip_proxied any;
+    gzip_vary on;
+    gzip_types
+        text/plain text/css text/xml text/javascript
+        application/json application/javascript application/xml
+        image/svg+xml;
+
+    # === lscache configuration ===
+    lscache_path          /var/cache/nginx/lscache;
+    lscache_max_size      512m;
+    lscache_purge_allowed 127.0.0.1 ::1 172.16.0.0/12 10.0.0.0/8;
+
+    server {
+        listen 80;
+        server_name localhost;
+        root  /var/www/html;
+        index index.php index.html;
+        charset UTF-8;
+
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+
+        # Static assets - serve directly, never through PHP / cache.
+        location ~* \.(jpg|jpeg|gif|png|webp|svg|ico|js|css|woff|woff2|ttf|eot)$ {
+            expires 30d;
+            access_log off;
+            add_header Cache-Control "public";
+        }
+
+        # Block hidden files.
+        location ~ /\. {
+            deny all;
+            return 404;
+        }
+
+        # WordPress front controller. lscache is enabled here so PHP
+        # responses with X-LiteSpeed-* headers get cached on disk.
+        location / {
+            lscache on;
+            lscache_strip_cookies _ga _gid _fbp _fbc utm_source utm_medium utm_campaign;
+            try_files $uri $uri/ /index.php?$args;
+        }
+
+        # PHP-FPM handler. Same lscache scope so per-page cache works.
+        location ~ \.php$ {
+            lscache on;
+            lscache_strip_cookies _ga _gid _fbp _fbc utm_source utm_medium utm_campaign;
+
+            fastcgi_pass php:9000;
+            fastcgi_index index.php;
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            include fastcgi_params;
+            fastcgi_read_timeout 300;
+            fastcgi_send_timeout 300;
+        }
+
+        # Block PHP execution in uploads.
+        location ~* /wp-content/uploads/.*\.php$ {
+            deny all;
+        }
+    }
+}
+EOF
+
+EXPOSE 80
+CMD ["/usr/local/nginx/sbin/nginx", "-g", "daemon off;"]

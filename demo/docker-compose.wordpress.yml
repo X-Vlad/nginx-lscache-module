@@ -1,0 +1,88 @@
+services:
+  nginx:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.wordpress
+    ports:
+      - "8080:80"
+    volumes:
+      - ./www/wordpress:/var/www/html
+    depends_on:
+      - php
+
+  php:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.php-wp
+    volumes:
+      - ./www/wordpress:/var/www/html
+    depends_on:
+      - mysql
+
+  wordpress-installer:
+    image: wordpress:cli
+    user: root
+    environment:
+      HOME: /tmp
+    depends_on:
+      - mysql
+      - php
+    volumes:
+      - ./www/wordpress:/var/www/html
+    working_dir: /var/www/html
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        echo "=== installer starting ==="
+
+        # Run wp-cli with a generous PHP memory_limit (wp core download
+        # extraction blows past the 128 MB default on modern releases).
+        WP() { php -d memory_limit=512M /usr/local/bin/wp --allow-root "$$@"; }
+
+        echo "waiting for MySQL ..."
+        for i in $$(seq 1 60); do
+          if mysql --ssl=0 -hmysql -uwp -pwppass \
+                   -e "SELECT 1" wordpress >/dev/null 2>&1; then
+            echo "  MySQL is up after $${i} attempt(s)"
+            break
+          fi
+          sleep 2
+        done
+
+        if [ ! -f /var/www/html/wp-config.php ]; then
+          echo "installing WordPress core ..."
+          cd /var/www/html
+          WP core download
+          WP config create \
+            --dbhost=mysql --dbname=wordpress --dbuser=wp --dbpass=wppass
+          WP core install \
+            --url=http://localhost:8080 \
+            --title="LSCache Demo" \
+            --admin_user=admin --admin_password=admin --admin_email=admin@example.com \
+            --skip-email
+          echo "installing litespeed-cache plugin ..."
+          WP plugin install litespeed-cache --activate
+          WP litespeed-option set cache 1 || true
+          WP litespeed-option set cache-priv 1 || true
+          chown -R www-data:www-data /var/www/html
+        else
+          echo "WordPress already installed."
+        fi
+
+        echo "=== installer finished. Visit http://localhost:8080 ==="
+
+  mysql:
+    image: mysql:8.0
+    command: ["--default-authentication-plugin=mysql_native_password"]
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: wordpress
+      MYSQL_USER: wp
+      MYSQL_PASSWORD: wppass
+    volumes:
+      - wp_mysql_data:/var/lib/mysql
+
+volumes:
+  wp_mysql_data:
