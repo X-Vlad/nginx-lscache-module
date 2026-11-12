@@ -9,9 +9,7 @@
  *   <lscache_path>/vary/<base-hex>/<hex-key>      vary back-reference (empty)
  *   <lscache_path>/tmp/<pid>-<seq>                in-flight writes
  *
- * Key:
- *   SHA1(scheme + "\n" + host + "\n" + uri + "\n" + args + "\n"
- *        + vary_string + "\n" + client_id)
+ * Key: see lsc_compute_key_full. The host is the one nginx routed by.
  *
  * Path traversal guard: every user-controlled component flowing into a path
  * (tag name, URL component, host name) passes through lsc_safe_name. Reject
@@ -52,27 +50,28 @@ lsc_hex_encode(const u_char *bin, ngx_uint_t bin_len, u_char *hex)
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Lowercase a buffer into a freshly allocated pool buffer
+ * The request's host: the name nginx picked the server by.
  * ═══════════════════════════════════════════════════════════════════════ */
 
-static u_char *
-lsc_tolower_dup(ngx_pool_t *pool, u_char *src, size_t len)
+void
+lsc_request_host(ngx_http_request_t *r, ngx_str_t *out)
 {
-    u_char    *dst;
-    ngx_uint_t i;
-
-    dst = ngx_pnalloc(pool, len);
-    if (dst == NULL) return NULL;
-    for (i = 0; i < len; i++) dst[i] = ngx_tolower(src[i]);
-    return dst;
+    /* headers_in.server is set from the request line when that is
+     * absolute, else from the Host header; nginx has validated and
+     * lowercased it and cut the port. */
+    *out = r->headers_in.server;
 }
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Compute the SHA-1 cache key.
  *
- * scheme + "\n" + host + "\n" + uri + "\n" + args + "\n"
- *        + vary_string + "\n" + client_id
+ * scheme "\n" host "\n" <len(uri)> ":" uri "\n" args "\n" vary_string
+ *        "\n" client_id "\n" default_vary
+ *
+ * The uri is the decoded one and may hold a "\n" (%0A) from the client,
+ * so its length goes in front of it: two different requests can then
+ * never give the same byte string.
  *
  * lsc_compute_key_full is the explicit-input form (used by the purge
  * executor when only a URL is known). lsc_compute_key wraps it with
@@ -80,13 +79,14 @@ lsc_tolower_dup(ngx_pool_t *pool, u_char *src, size_t len)
  * ═══════════════════════════════════════════════════════════════════════ */
 
 void
-lsc_compute_key_full(ngx_pool_t *pool, int is_https,
+lsc_compute_key_full(int is_https,
     ngx_str_t *host, ngx_str_t *uri, ngx_str_t *args,
-    ngx_str_t *vary_string, ngx_str_t *client_id,
+    ngx_str_t *vary_string, ngx_str_t *client_id, ngx_str_t *default_vary,
     u_char out_bin[LSC_KEY_BIN_LEN])
 {
     ngx_sha1_t  sha;
-    u_char     *lower;
+    u_char      c;
+    size_t      i;
     static const u_char nl = '\n';
 
     ngx_sha1_init(&sha);
@@ -96,12 +96,18 @@ lsc_compute_key_full(ngx_pool_t *pool, int is_https,
     ngx_sha1_update(&sha, &nl, 1);
 
     if (host && host->len > 0) {
-        lower = lsc_tolower_dup(pool, host->data, host->len);
-        if (lower) ngx_sha1_update(&sha, lower,      host->len);
-        else       ngx_sha1_update(&sha, host->data, host->len);
+        for (i = 0; i < host->len; i++) {
+            c = ngx_tolower(host->data[i]);
+            ngx_sha1_update(&sha, &c, 1);
+        }
     }
     ngx_sha1_update(&sha, &nl, 1);
 
+    {
+        u_char lenbuf[NGX_SIZE_T_LEN + 1], *le;
+        le = ngx_sprintf(lenbuf, "%uz:", uri ? uri->len : (size_t) 0);
+        ngx_sha1_update(&sha, lenbuf, le - lenbuf);
+    }
     if (uri && uri->len > 0) {
         ngx_sha1_update(&sha, uri->data, uri->len);
     }
@@ -120,6 +126,11 @@ lsc_compute_key_full(ngx_pool_t *pool, int is_https,
     if (client_id && client_id->len > 0) {
         ngx_sha1_update(&sha, client_id->data, client_id->len);
     }
+    ngx_sha1_update(&sha, &nl, 1);
+
+    if (default_vary && default_vary->len > 0) {
+        ngx_sha1_update(&sha, default_vary->data, default_vary->len);
+    }
 
     ngx_sha1_final(out_bin, &sha);
 }
@@ -127,23 +138,25 @@ lsc_compute_key_full(ngx_pool_t *pool, int is_https,
 
 void
 lsc_compute_key(ngx_http_request_t *r, ngx_str_t *vary_string,
-    ngx_str_t *client_id, u_char out_bin[LSC_KEY_BIN_LEN])
+    ngx_str_t *client_id, int with_default_vary,
+    u_char out_bin[LSC_KEY_BIN_LEN])
 {
-    ngx_str_t host = ngx_null_string;
+    ngx_str_t host;
+    ngx_str_t dv = ngx_null_string;
     int       is_https = 0;
 
 #if (NGX_HTTP_SSL)
     if (r->connection->ssl) is_https = 1;
 #endif
 
-    if (r->headers_in.host && r->headers_in.host->value.len > 0) {
-        host = r->headers_in.host->value;
-    } else if (r->headers_in.server.len > 0) {
-        host = r->headers_in.server;
+    lsc_request_host(r, &host);
+    if (with_default_vary && lsc_default_vary(r, &dv) != NGX_OK) {
+        /* out of memory: a key no healthy request computes */
+        ngx_str_set(&dv, "\x01unknown");
     }
 
-    lsc_compute_key_full(r->pool, is_https, &host, &r->uri, &r->args,
-                         vary_string, client_id, out_bin);
+    lsc_compute_key_full(is_https, &host, &r->uri, &r->args,
+                         vary_string, client_id, &dv, out_bin);
 }
 
 
@@ -459,9 +472,74 @@ lsc_finalize_tmp(ngx_http_request_t *r, u_char *tmp_path,
  * Returns NGX_OK if the data file was unlinked, NGX_DECLINED otherwise.
  * ═══════════════════════════════════════════════════════════════════════ */
 
+/* Remove one index marker and, when that emptied its folder, the folder
+ * (rmdir of a folder still in use just fails). `path` is NUL-terminated
+ * and is put back as it was. */
+static void
+lsc_drop_ref(ngx_str_t *path)
+{
+    u_char *slash;
+
+    (void) ngx_delete_file(path->data);
+    slash = path->data + path->len;
+    while (slash > path->data && *slash != '/') slash--;
+    if (slash == path->data) return;
+    *slash = '\0';
+    (void) rmdir((char *) path->data);
+    *slash = '/';
+}
+
+
+/* Create an empty index marker, making its folder when missing. A
+ * purge may remove the emptied folder between our mkdir and our open,
+ * so the pair is tried a few times. `path` is NUL-terminated. */
 ngx_int_t
-lsc_unlink_entry(ngx_http_request_t *r, u_char *hex_key, int want_private,
-    ngx_str_t *host_filter)
+lsc_touch_ref(u_char *path, size_t len, ngx_log_t *log)
+{
+    u_char     *slash;
+    ngx_fd_t    fd;
+    ngx_uint_t  attempt;
+
+    slash = path + len;
+    while (slash > path && *slash != '/') slash--;
+    if (slash == path) return NGX_ERROR;
+
+    for (attempt = 0; attempt < 3; attempt++) {
+        *slash = '\0';
+        (void) lsc_mkpath(path, 0750, log);
+        *slash = '/';
+        fd = open((char *) path, O_WRONLY | O_CREAT | O_CLOEXEC, 0640);
+        if (fd >= 0) {
+            close(fd);
+            return NGX_OK;
+        }
+        if (errno != ENOENT) break;
+    }
+    ngx_log_error(NGX_LOG_ERR, log, errno,
+        "lscache: index marker \"%s\" not created", path);
+    return NGX_ERROR;
+}
+
+
+/* Shared size counter. */
+void
+lsc_account(ngx_http_request_t *r, off_t delta)
+{
+    ngx_http_lsc_main_conf_t *mcf;
+    lsc_shared_t             *sh;
+
+    if (delta == 0) return;
+    mcf = ngx_http_get_module_main_conf(r, ngx_http_lscache_module);
+    if (mcf == NULL || mcf->stat_zone == NULL) return;
+    sh = mcf->stat_zone->data;
+    if (sh == NULL) return;
+    (void) ngx_atomic_fetch_add(&sh->bytes, (ngx_atomic_int_t) delta);
+}
+
+
+static ngx_int_t
+lsc_unlink_entry_in(ngx_http_request_t *r, ngx_pool_t *pool, u_char *hex_key,
+    int want_private, ngx_str_t *host_filter)
 {
     ngx_http_lsc_main_conf_t *mcf;
     ngx_str_t                 data_path, meta_path, side_path;
@@ -478,8 +556,8 @@ lsc_unlink_entry(ngx_http_request_t *r, u_char *hex_key, int want_private,
     mcf = ngx_http_get_module_main_conf(r, ngx_http_lscache_module);
     if (mcf->path.len == 0) return NGX_ERROR;
 
-    if (lsc_data_path(r->pool, &mcf->path, hex_key, &data_path) != NGX_OK
-        || lsc_meta_path(r->pool, &mcf->path, hex_key, &meta_path) != NGX_OK)
+    if (lsc_data_path(pool, &mcf->path, hex_key, &data_path) != NGX_OK
+        || lsc_meta_path(pool, &mcf->path, hex_key, &meta_path) != NGX_OK)
     {
         return NGX_ERROR;
     }
@@ -498,7 +576,7 @@ lsc_unlink_entry(ngx_http_request_t *r, u_char *hex_key, int want_private,
         }
         if (to_read > LSC_META_MAX) to_read = LSC_META_MAX;
         if (to_read > 0) {
-            meta_buf = ngx_pnalloc(r->pool, to_read + 1);
+            meta_buf = ngx_pnalloc(pool, to_read + 1);
             if (meta_buf != NULL) {
                 nread = ngx_read_fd(fd, meta_buf, to_read);
                 if (nread <= 0) nread = 0;
@@ -557,10 +635,10 @@ lsc_unlink_entry(ngx_http_request_t *r, u_char *hex_key, int want_private,
                     tag.len--;
                 if (tag.len > 0
                     && lsc_safe_name(&tag) == NGX_OK
-                    && lsc_tag_path(r->pool, &mcf->path, &tag, hex_key,
+                    && lsc_tag_path(pool, &mcf->path, &tag, hex_key,
                                     &side_path) == NGX_OK)
                 {
-                    (void) ngx_delete_file(side_path.data);
+                    lsc_drop_ref(&side_path);
                 }
             } else if (eol - line > 5
                        && ngx_strncmp(line, "host ", 5) == 0)
@@ -573,10 +651,10 @@ lsc_unlink_entry(ngx_http_request_t *r, u_char *hex_key, int want_private,
                     host.len--;
                 if (host.len > 0
                     && lsc_safe_name(&host) == NGX_OK
-                    && lsc_host_path(r->pool, &mcf->path, &host, hex_key,
+                    && lsc_host_path(pool, &mcf->path, &host, hex_key,
                                      &side_path) == NGX_OK)
                 {
-                    (void) ngx_delete_file(side_path.data);
+                    lsc_drop_ref(&side_path);
                 }
             } else if (eol - line > 5
                        && ngx_strncmp(line, "base ", 5) == 0)
@@ -595,10 +673,10 @@ lsc_unlink_entry(ngx_http_request_t *r, u_char *hex_key, int want_private,
                         { ok = 0; break; }
                     }
                     if (ok
-                        && lsc_vary_path(r->pool, &mcf->path, base,
+                        && lsc_vary_path(pool, &mcf->path, base,
                                          hex_key, &side_path) == NGX_OK)
                     {
-                        (void) ngx_delete_file(side_path.data);
+                        lsc_drop_ref(&side_path);
                     }
                 }
             }
@@ -607,205 +685,337 @@ lsc_unlink_entry(ngx_http_request_t *r, u_char *hex_key, int want_private,
         }
     }
 
-    if (ngx_delete_file(data_path.data) == 0) rc = NGX_OK;
+    {
+        struct stat dst;
+        off_t       dsize = 0;
+        if (stat((char *) data_path.data, &dst) == 0) dsize = dst.st_size;
+        if (ngx_delete_file(data_path.data) == 0) {
+            rc = NGX_OK;
+            lsc_account(r, -dsize);
+        }
+    }
     (void) ngx_delete_file(meta_path.data);
     return rc;
 }
 
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Walk a back-reference directory and unlink every entry it points at.
- *
- * Each filename in `dir` is the 40-char hex key of a cache entry. For each,
- * call lsc_unlink_entry with the desired privacy filter and bump *count for
- * the ones we actually unlinked.
- *
- * `dir->data` must be NUL-terminated.
- * ═══════════════════════════════════════════════════════════════════════ */
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Size-based eviction (driven by the lscache_max_size directive).
- *
- * Triggered every ~100 successful writes (per worker). Walks data/<HH>/<HH>/,
- * sums file sizes. If the total exceeds max_size, sorts entries by mtime
- * ascending and unlinks oldest until total drops below max_size.
- *
- * Concurrent workers may run this in parallel; double-unlinks are harmless
- * because lsc_unlink_entry's unlink() returns -1/ENOENT and we ignore it.
- * ═══════════════════════════════════════════════════════════════════════ */
-
-#define LSC_EVICT_TRIGGER_EVERY  100
-#define LSC_EVICT_MAX_ENTRIES    65536
-
-typedef struct {
-    u_char  hex[LSC_KEY_HEX_LEN];
-    time_t  mtime;
-    off_t   size;
-} lsc_evict_t;
-
-
-static ngx_uint_t lsc_writes_since_check = 0;
-
-
-static int
-lsc_evict_cmp_mtime(const void *a, const void *b)
+/* Runs with a pool of its own: purges and sweeps call this for
+ * thousands of entries within one request. */
+ngx_int_t
+lsc_unlink_entry(ngx_http_request_t *r, u_char *hex_key, int want_private,
+    ngx_str_t *host_filter)
 {
-    const lsc_evict_t *ea = a, *eb = b;
-    if (ea->mtime < eb->mtime) return -1;
-    if (ea->mtime > eb->mtime) return  1;
-    return 0;
+    ngx_pool_t *pool;
+    ngx_int_t   rc;
+
+    pool = ngx_create_pool(4096, r->connection->log);
+    if (pool == NULL) return NGX_ERROR;
+    rc = lsc_unlink_entry_in(r, pool, hex_key, want_private, host_filter);
+    ngx_destroy_pool(pool);
+    return rc;
 }
 
 
-static void
-lsc_walk_data_shard(u_char *shard_path, ngx_pool_t *pool, ngx_array_t *out,
-    ngx_log_t *log)
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Is this entry no longer servable (missing, damaged, or expired)?
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static ngx_uint_t
+lsc_entry_dead(u_char *data_path, off_t *size_out)
 {
-    ngx_dir_t  d;
-    ngx_str_t  p;
-    u_char     file_path[LSC_PATH_MAX];
-    ngx_uint_t i;
-    size_t     nl, shard_len;
-    u_char    *name;
+    ngx_fd_t     fd;
+    u_char       hdr[LSC_FILE_HEADER_BYTES];
+    struct stat  st;
+    uint64_t     expires = 0;
+    uint32_t     body_len;
+    ngx_uint_t   i, dead = 0;
 
-    p.data = shard_path;
-    p.len  = ngx_strlen(shard_path);
-    if (ngx_open_dir(&p, &d) != NGX_OK) return;
+    if (size_out) *size_out = 0;
+    fd = open((char *) data_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 1;
+    if (fstat(fd, &st) != 0
+        || read(fd, hdr, sizeof(hdr)) != (ssize_t) sizeof(hdr)
+        || hdr[0] != 'L' || hdr[1] != 'S' || hdr[2] != 'C' || hdr[3] != '1')
+    {
+        close(fd);
+        return 1;
+    }
+    close(fd);
+    if (size_out) *size_out = st.st_size;
 
-    shard_len = p.len;
+    body_len = (uint32_t) hdr[4] | ((uint32_t) hdr[5] << 8)
+             | ((uint32_t) hdr[6] << 16) | ((uint32_t) hdr[7] << 24);
+    for (i = 0; i < 8; i++) expires |= ((uint64_t) hdr[12 + i]) << (i * 8);
+
+    if ((off_t) body_len + LSC_FILE_HEADER_BYTES != st.st_size) dead = 1;
+    if ((time_t) expires <= ngx_time()) dead = 1;
+    return dead;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * May one more variant of this URL be stored?
+ *
+ * A URL's variants (vary values, private copies) are index markers in
+ * vary/<base>/, and every miss walks them, so their number is capped
+ * (lscache_max_variants). At the cap the expired ones are removed
+ * first. NGX_OK: room (or `key_hex` is already one of them).
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+ngx_int_t
+lsc_variant_room(ngx_http_request_t *r, u_char *base_hex, u_char *key_hex,
+    ngx_uint_t max)
+{
+    ngx_http_lsc_main_conf_t *mcf;
+    ngx_str_t                 dir, dpath;
+    ngx_dir_t                 d;
+    u_char                    names[256][LSC_KEY_HEX_LEN + 1];
+    ngx_uint_t                n = 0, i, j, live;
+    u_char                   *raw;
+
+    if (max > 256) max = 256;
+
+    mcf = ngx_http_get_module_main_conf(r, ngx_http_lscache_module);
+    dir.len  = mcf->path.len + sizeof("/vary/") - 1 + LSC_KEY_HEX_LEN;
+    dir.data = ngx_pnalloc(r->pool, dir.len + 1);
+    if (dir.data == NULL) return NGX_ERROR;
+    raw = ngx_cpymem(dir.data, mcf->path.data, mcf->path.len);
+    raw = ngx_cpymem(raw, "/vary/", 6);
+    raw = ngx_cpymem(raw, base_hex, LSC_KEY_HEX_LEN);
+    *raw = '\0';
+
+    if (ngx_open_dir(&dir, &d) != NGX_OK) return NGX_OK;   /* no variants */
     for (;;) {
         ngx_set_errno(0);
         if (ngx_read_dir(&d) != NGX_OK) break;
-        nl = ngx_de_namelen(&d);
-        if (nl != LSC_KEY_HEX_LEN) continue;
-        name = ngx_de_name(&d);
-
-        for (i = 0; i < LSC_KEY_HEX_LEN; i++) {
-            u_char c = name[i];
+        if (ngx_de_namelen(&d) != LSC_KEY_HEX_LEN) continue;
+        raw = ngx_de_name(&d);
+        for (j = 0; j < LSC_KEY_HEX_LEN; j++) {
+            u_char c = raw[j];
             if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) break;
         }
-        if (i != LSC_KEY_HEX_LEN) continue;
-        if (out->nelts >= LSC_EVICT_MAX_ENTRIES) break;
+        if (j != LSC_KEY_HEX_LEN) continue;
+        if (ngx_memcmp(raw, key_hex, LSC_KEY_HEX_LEN) == 0) {
+            ngx_close_dir(&d);
+            return NGX_OK;
+        }
+        if (n < 256) {
+            ngx_memcpy(names[n], raw, LSC_KEY_HEX_LEN);
+            names[n][LSC_KEY_HEX_LEN] = '\0';
+        }
+        n++;
+    }
+    ngx_close_dir(&d);
 
-        if (shard_len + 1 + LSC_KEY_HEX_LEN >= sizeof(file_path)) continue;
-        ngx_memcpy(file_path, shard_path, shard_len);
-        file_path[shard_len] = '/';
-        ngx_memcpy(file_path + shard_len + 1, name, LSC_KEY_HEX_LEN);
-        file_path[shard_len + 1 + LSC_KEY_HEX_LEN] = '\0';
+    if (n < max) return NGX_OK;
 
+    live = n;
+    for (i = 0; i < n && i < 256; i++) {
+        if (lsc_data_path(r->pool, &mcf->path, names[i], &dpath) != NGX_OK) {
+            continue;
+        }
+        if (lsc_entry_dead(dpath.data, NULL)) {
+            (void) lsc_unlink_entry(r, names[i], -1, NULL);
+            /* a marker whose entry is gone has no meta to find it by */
+            if (lsc_vary_path(r->pool, &mcf->path, base_hex, names[i],
+                              &dpath) == NGX_OK)
+            {
+                lsc_drop_ref(&dpath);
+            }
+            live--;
+        }
+    }
+    return live < max ? NGX_OK : NGX_DECLINED;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Background sweep (driven by stores; lscache_max_size).
+ *
+ * The total size of the data files lives in shared memory and is kept
+ * by the store and unlink paths; a full recount runs once after start
+ * and then hourly, to correct drift. Every LSC_SWEEP_EVERY stores of a
+ * worker, one worker at a time walks the next first-level folder of
+ * data/ (a cursor in shared memory goes round all 256) and removes what
+ * is expired or damaged. While the cache is over lscache_max_size the
+ * walk goes on through the following folders and removes live entries
+ * too, until the size is 10% under the limit or LSC_SWEEP_UNLINKS
+ * entries are gone (the next call goes on from there; one call removes
+ * far more than the stores between two calls can add). Which live
+ * entries go is decided by where the cursor is, not by age.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+#define LSC_SWEEP_EVERY        64
+#define LSC_SWEEP_UNLINKS      2048    /* per call                      */
+#define LSC_RECOUNT_INTERVAL   3600
+#define LSC_SWEEP_LOCK_STALE   120
+
+static ngx_uint_t lsc_stores_since_sweep = 0;
+
+
+/* Walk one shard. mode 0: add sizes to *total. mode 1: remove dead
+ * entries, and live ones while the shared size is above `target`. */
+static void
+lsc_sweep_shard(ngx_http_request_t *r, ngx_http_lsc_main_conf_t *mcf,
+    lsc_shared_t *sh, ngx_uint_t shard, int mode, off_t target,
+    off_t *total, ngx_uint_t *unlinks)
+{
+    u_char      path[LSC_PATH_MAX], file[LSC_PATH_MAX];
+    u_char      name[LSC_KEY_HEX_LEN + 1];
+    ngx_str_t   dir;
+    ngx_dir_t   d;
+    u_char     *raw;
+    size_t      dl;
+    ngx_uint_t  j;
+    off_t       size;
+    struct stat st;
+
+    /* <root>/data/HH/HH */
+    raw = ngx_cpymem(path, mcf->path.data, mcf->path.len);
+    raw = ngx_cpymem(raw, "/data/", 6);
+    *raw++ = lsc_hex_chars[(shard >> 12) & 0xF];
+    *raw++ = lsc_hex_chars[(shard >> 8) & 0xF];
+    *raw++ = '/';
+    *raw++ = lsc_hex_chars[(shard >> 4) & 0xF];
+    *raw++ = lsc_hex_chars[shard & 0xF];
+    *raw = '\0';
+    dir.data = path;
+    dir.len  = raw - path;
+    dl = dir.len;
+    if (ngx_open_dir(&dir, &d) != NGX_OK) return;
+
+    for (;;) {
+        ngx_set_errno(0);
+        if (ngx_read_dir(&d) != NGX_OK) break;
+        if (ngx_de_namelen(&d) != LSC_KEY_HEX_LEN) continue;
+        raw = ngx_de_name(&d);
+        for (j = 0; j < LSC_KEY_HEX_LEN; j++) {
+            u_char c = raw[j];
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) break;
+        }
+        if (j != LSC_KEY_HEX_LEN) continue;
+        ngx_memcpy(name, raw, LSC_KEY_HEX_LEN);
+        name[LSC_KEY_HEX_LEN] = '\0';
+
+        ngx_memcpy(file, path, dl);
+        file[dl] = '/';
+        ngx_memcpy(file + dl + 1, name, LSC_KEY_HEX_LEN);
+        file[dl + 1 + LSC_KEY_HEX_LEN] = '\0';
+
+        if (mode == 0) {
+            if (stat((char *) file, &st) == 0 && S_ISREG(st.st_mode)) {
+                *total += st.st_size;
+            }
+            continue;
+        }
+
+        if (*unlinks >= LSC_SWEEP_UNLINKS) break;
+        if (lsc_entry_dead(file, &size)
+            || (target >= 0 && (off_t) sh->bytes > target))
         {
-            struct stat st;
-            lsc_evict_t *e;
-            if (stat((char *)file_path, &st) != 0) continue;
-            if (!S_ISREG(st.st_mode)) continue;
-            e = ngx_array_push(out);
-            if (e == NULL) break;
-            ngx_memcpy(e->hex, name, LSC_KEY_HEX_LEN);
-            e->mtime = st.st_mtime;
-            e->size  = st.st_size;
+            (void) lsc_unlink_entry(r, name, -1, NULL);
+            (*unlinks)++;
         }
     }
     ngx_close_dir(&d);
-    (void) pool;
-    (void) log;
+}
+
+
+/* Walk the shards that exist under one first-level folder (data/HH). */
+static void
+lsc_sweep_level1(ngx_http_request_t *r, ngx_http_lsc_main_conf_t *mcf,
+    lsc_shared_t *sh, ngx_uint_t l1, int mode, off_t target,
+    off_t *total, ngx_uint_t *unlinks)
+{
+    u_char      path[LSC_PATH_MAX], *p, *raw;
+    ngx_str_t   dir;
+    ngx_dir_t   d;
+    ngx_int_t   l2;
+
+    p = ngx_cpymem(path, mcf->path.data, mcf->path.len);
+    p = ngx_cpymem(p, "/data/", 6);
+    *p++ = lsc_hex_chars[(l1 >> 4) & 0xF];
+    *p++ = lsc_hex_chars[l1 & 0xF];
+    *p = '\0';
+    dir.data = path;
+    dir.len  = p - path;
+    if (ngx_open_dir(&dir, &d) != NGX_OK) return;
+
+    for (;;) {
+        ngx_set_errno(0);
+        if (ngx_read_dir(&d) != NGX_OK) break;
+        if (ngx_de_namelen(&d) != 2) continue;
+        raw = ngx_de_name(&d);
+        l2 = ngx_hextoi(raw, 2);
+        if (l2 == NGX_ERROR) continue;
+        if (mode == 1 && *unlinks >= LSC_SWEEP_UNLINKS) break;
+        lsc_sweep_shard(r, mcf, sh, (l1 << 8) | (ngx_uint_t) l2, mode,
+                        target, total, unlinks);
+    }
+    ngx_close_dir(&d);
 }
 
 
 void
-lsc_maybe_evict(ngx_http_request_t *r)
+lsc_maintain(ngx_http_request_t *r)
 {
     ngx_http_lsc_main_conf_t *mcf;
-    ngx_pool_t               *pool;
-    ngx_array_t              *entries;
-    ngx_dir_t                 d;
-    ngx_str_t                 data_dir, level1_dir;
-    u_char                    l1_path[LSC_PATH_MAX];
-    u_char                    l2_path[LSC_PATH_MAX];
-    u_char                   *p, *l1_name;
-    size_t                    nl;
-    off_t                     total = 0;
-    ngx_uint_t                i;
-    lsc_evict_t              *list;
+    lsc_shared_t             *sh;
+    ngx_atomic_uint_t         held;
+    time_t                    now;
+    ngx_uint_t                l1, n, unlinks = 0;
+    off_t                     total = 0, target;
 
-    if (++lsc_writes_since_check < LSC_EVICT_TRIGGER_EVERY) return;
-    lsc_writes_since_check = 0;
+    if (++lsc_stores_since_sweep < LSC_SWEEP_EVERY) return;
+    lsc_stores_since_sweep = 0;
 
     mcf = ngx_http_get_module_main_conf(r, ngx_http_lscache_module);
-    if (mcf == NULL || mcf->path.len == 0 || mcf->max_size <= 0) return;
-
-    pool = ngx_create_pool(64 * 1024, r->connection->log);
-    if (pool == NULL) return;
-
-    entries = ngx_array_create(pool, 256, sizeof(lsc_evict_t));
-    if (entries == NULL) goto out;
-
-    if (mcf->path.len + sizeof("/data") >= sizeof(l1_path)) goto out;
-    p = ngx_cpymem(l1_path, mcf->path.data, mcf->path.len);
-    p = ngx_cpymem(p, "/data", 5);
-    *p = '\0';
-    data_dir.data = l1_path;
-    data_dir.len  = p - l1_path;
-
-    if (ngx_open_dir(&data_dir, &d) != NGX_OK) goto out;
-    for (;;) {
-        ngx_set_errno(0);
-        if (ngx_read_dir(&d) != NGX_OK) break;
-        nl = ngx_de_namelen(&d);
-        if (nl != 2) continue;
-        l1_name = ngx_de_name(&d);
-        if (!isxdigit(l1_name[0]) || !isxdigit(l1_name[1])) continue;
-
-        /* descend into <root>/data/<HH>/ */
-        if (data_dir.len + 1 + 2 >= sizeof(l1_path)) continue;
-        ngx_memcpy(l1_path + data_dir.len + 1, l1_name, 2);
-        l1_path[data_dir.len] = '/';
-        l1_path[data_dir.len + 3] = '\0';
-        level1_dir.data = l1_path;
-        level1_dir.len  = data_dir.len + 3;
-
-        {
-            ngx_dir_t  d2;
-            u_char    *l2_name;
-            size_t     nl2;
-            if (ngx_open_dir(&level1_dir, &d2) != NGX_OK) continue;
-            for (;;) {
-                ngx_set_errno(0);
-                if (ngx_read_dir(&d2) != NGX_OK) break;
-                nl2 = ngx_de_namelen(&d2);
-                if (nl2 != 2) continue;
-                l2_name = ngx_de_name(&d2);
-                if (!isxdigit(l2_name[0]) || !isxdigit(l2_name[1])) continue;
-
-                if (level1_dir.len + 1 + 2 >= sizeof(l2_path)) continue;
-                ngx_memcpy(l2_path, level1_dir.data, level1_dir.len);
-                l2_path[level1_dir.len] = '/';
-                ngx_memcpy(l2_path + level1_dir.len + 1, l2_name, 2);
-                l2_path[level1_dir.len + 3] = '\0';
-
-                lsc_walk_data_shard(l2_path, pool, entries, r->connection->log);
-            }
-            ngx_close_dir(&d2);
-        }
+    if (mcf == NULL || mcf->path.len == 0 || mcf->stat_zone == NULL) return;
+    if (mcf->path.len + sizeof("/data/xx/xx/") + LSC_KEY_HEX_LEN
+        >= LSC_PATH_MAX)
+    {
+        return;
     }
-    ngx_close_dir(&d);
+    sh = mcf->stat_zone->data;
+    if (sh == NULL) return;
 
-    if (entries->nelts == 0) goto out;
+    /* one worker at a time; a lock left by a dead worker times out */
+    now  = ngx_time();
+    held = sh->busy;
+    if (held != 0 && now - (time_t) held < LSC_SWEEP_LOCK_STALE) return;
+    if (!ngx_atomic_cmp_set(&sh->busy, held, (ngx_atomic_uint_t) now)) return;
 
-    list = entries->elts;
-    for (i = 0; i < entries->nelts; i++) total += list[i].size;
-
-    if (total <= mcf->max_size) goto out;
-
-    qsort(list, entries->nelts, sizeof(lsc_evict_t), lsc_evict_cmp_mtime);
-
-    for (i = 0; i < entries->nelts && total > mcf->max_size; i++) {
-        if (lsc_unlink_entry(r, list[i].hex, -1, NULL) == NGX_OK) {
-            total -= list[i].size;
+    if (!sh->counted
+        || now - (time_t) sh->last_recount > LSC_RECOUNT_INTERVAL)
+    {
+        total = 0;
+        for (l1 = 0; l1 < 256; l1++) {
+            lsc_sweep_level1(r, mcf, sh, l1, 0, -1, &total, &unlinks);
         }
+        sh->bytes        = (ngx_atomic_uint_t) total;
+        sh->last_recount = (ngx_atomic_uint_t) now;
+        sh->counted      = 1;
     }
 
-out:
-    ngx_destroy_pool(pool);
+    /* the counter is unsigned and two workers may undercount briefly */
+    if ((ngx_atomic_int_t) sh->bytes < 0) sh->bytes = 0;
+
+    target = -1;
+    if (mcf->max_size > 0 && (off_t) sh->bytes > mcf->max_size) {
+        target = mcf->max_size - mcf->max_size / 10;
+    }
+
+    /* one folder when within the limit; when over it, as many as it
+     * takes (at most once round, and at most LSC_SWEEP_UNLINKS) */
+    l1 = (ngx_uint_t) sh->cursor & 0xFF;
+    for (n = 0; n < 256; n++) {
+        lsc_sweep_level1(r, mcf, sh, l1, 1, target, &total, &unlinks);
+        l1 = (l1 + 1) & 0xFF;
+        if (unlinks >= LSC_SWEEP_UNLINKS) break;
+        if (target < 0 || (off_t) sh->bytes <= target) break;
+    }
+    sh->cursor = l1;
+    sh->busy   = 0;
 }
 
 
@@ -822,9 +1032,9 @@ out:
  * rejected, NGX_ERROR on I/O failure.
  * ═══════════════════════════════════════════════════════════════════════ */
 
-ngx_int_t
-lsc_mark_stale(ngx_http_request_t *r, u_char *hex_key, int want_private,
-    ngx_str_t *host_filter)
+static ngx_int_t
+lsc_mark_stale_in(ngx_http_request_t *r, ngx_pool_t *pool, u_char *hex_key,
+    int want_private, ngx_str_t *host_filter)
 {
     ngx_http_lsc_main_conf_t *mcf;
     ngx_str_t                 data_path, meta_path;
@@ -842,8 +1052,8 @@ lsc_mark_stale(ngx_http_request_t *r, u_char *hex_key, int want_private,
     mcf = ngx_http_get_module_main_conf(r, ngx_http_lscache_module);
     if (mcf->path.len == 0) return NGX_ERROR;
 
-    if (lsc_data_path(r->pool, &mcf->path, hex_key, &data_path) != NGX_OK
-        || lsc_meta_path(r->pool, &mcf->path, hex_key, &meta_path) != NGX_OK)
+    if (lsc_data_path(pool, &mcf->path, hex_key, &data_path) != NGX_OK
+        || lsc_meta_path(pool, &mcf->path, hex_key, &meta_path) != NGX_OK)
     {
         return NGX_ERROR;
     }
@@ -859,7 +1069,7 @@ lsc_mark_stale(ngx_http_request_t *r, u_char *hex_key, int want_private,
             }
             if (to_read > LSC_META_MAX) to_read = LSC_META_MAX;
             if (to_read > 0) {
-                meta_buf = ngx_pnalloc(r->pool, to_read + 1);
+                meta_buf = ngx_pnalloc(pool, to_read + 1);
                 if (meta_buf != NULL) {
                     nread = ngx_read_fd(fd, meta_buf, to_read);
                     if (nread <= 0) nread = 0;
@@ -926,6 +1136,23 @@ lsc_mark_stale(ngx_http_request_t *r, u_char *hex_key, int want_private,
     }
     close(fd);
     return NGX_OK;
+}
+
+
+/* Runs with a pool of its own: purges and sweeps call this for
+ * thousands of entries within one request. */
+ngx_int_t
+lsc_mark_stale(ngx_http_request_t *r, u_char *hex_key, int want_private,
+    ngx_str_t *host_filter)
+{
+    ngx_pool_t *pool;
+    ngx_int_t   rc;
+
+    pool = ngx_create_pool(4096, r->connection->log);
+    if (pool == NULL) return NGX_ERROR;
+    rc = lsc_mark_stale_in(r, pool, hex_key, want_private, host_filter);
+    ngx_destroy_pool(pool);
+    return rc;
 }
 
 

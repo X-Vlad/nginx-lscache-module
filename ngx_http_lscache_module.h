@@ -31,6 +31,9 @@
 #define LSC_PATH_MAX           4096
 #define LSC_META_MAX           32768       /* hard cap on meta sidecar size */
 #define LSC_LSC_COOKIE_MAX     4096        /* cap on LSC-Cookie value length */
+#define LSC_VARY_DIRECTIVE_MAX 1024        /* cap on X-LiteSpeed-Vary length */
+#define LSC_CONTENT_TYPE_MAX   255
+#define LSC_DEFAULT_VARY_COOKIE "_lscache_vary"
 
 /* X-LiteSpeed-Cache-Control bit flags (parsed from upstream response) */
 #define LSC_CC_NO_CACHE        0x0001
@@ -72,7 +75,18 @@ typedef struct {
     ngx_str_t       path;        /* lscache_path (cycle-scope; required) */
     off_t           max_size;    /* lscache_max_size */
     ngx_array_t    *purge_acl;   /* of lsc_acl_t; default 127.0.0.1 + ::1 */
+    ngx_shm_zone_t *stat_zone;   /* shared counters (size, sweep cursor) */
 } ngx_http_lsc_main_conf_t;
+
+/* Shared between workers: total size of data files and the state of the
+ * background sweep. All fields are updated with atomic operations. */
+typedef struct {
+    ngx_atomic_t    bytes;        /* sum of data file sizes */
+    ngx_atomic_t    counted;      /* 1 once a full recount has run */
+    ngx_atomic_t    last_recount; /* time of the last full recount */
+    ngx_atomic_t    cursor;       /* next data/HH folder (0..255) to sweep */
+    ngx_atomic_t    busy;         /* time a worker took the sweep, or 0 */
+} lsc_shared_t;
 
 typedef struct {
     ngx_flag_t      enable;              /* lscache on/off */
@@ -83,6 +97,8 @@ typedef struct {
     ngx_array_t    *strip_cookies;       /* of ngx_str_t */
     ngx_http_complex_value_t *bypass;
     ngx_http_complex_value_t *no_cache;
+    ngx_http_complex_value_t *vary_extra;  /* lscache_vary_extra */
+    ngx_uint_t      max_variants;        /* per URL */
     ngx_flag_t      debug;
 } ngx_http_lsc_loc_conf_t;
 
@@ -110,8 +126,11 @@ typedef struct {
     unsigned        no_store:1;
     unsigned        has_set_cookie:1;
     unsigned        has_unsafe_vary:1;
+    unsigned        has_content_encoding:1;
     unsigned        finalized:1;
     ngx_uint_t      status;            /* LSC_ST_* */
+    ngx_uint_t      resp_status;       /* upstream status seen by our filter */
+    ngx_str_t       hdr_block;         /* "hdr Name: value\n" lines to store */
 
     /* parsed from upstream response */
     ngx_uint_t      cc_flags;
@@ -155,14 +174,28 @@ void      lsc_filters_install(void);
 ngx_int_t lsc_precontent_handler(ngx_http_request_t *r);
 
 /* storage.c - key derivation, file paths, atomic write */
+/* with_default_vary: mix in the default vary (the _lscache_vary cookie
+ * and lscache_vary_extra). Pass 0 for the index key that names the
+ * vary/<base>/ folder and that url= purges compute. */
 void      lsc_compute_key(ngx_http_request_t *r, ngx_str_t *vary_string,
-                          ngx_str_t *client_id,
+                          ngx_str_t *client_id, int with_default_vary,
                           u_char out_bin[LSC_KEY_BIN_LEN]);
-void      lsc_compute_key_full(ngx_pool_t *pool, int is_https,
+void      lsc_compute_key_full(int is_https,
                                ngx_str_t *host, ngx_str_t *uri,
                                ngx_str_t *args, ngx_str_t *vary_string,
-                               ngx_str_t *client_id,
+                               ngx_str_t *client_id, ngx_str_t *default_vary,
                                u_char out_bin[LSC_KEY_BIN_LEN]);
+/* The host nginx chose the server by (validated, lowercased, no port).
+ * Never the raw Host header: with an absolute request line the two can
+ * differ, and a key built from the header would let one site write
+ * into another site's cache. */
+void      lsc_request_host(ngx_http_request_t *r, ngx_str_t *out);
+ngx_table_elt_t *lsc_push_header(ngx_http_request_t *r, const char *key,
+                                 size_t key_len, ngx_str_t *value);
+ngx_int_t lsc_touch_ref(u_char *path, size_t len, ngx_log_t *log);
+ngx_int_t lsc_variant_room(ngx_http_request_t *r, u_char *base_hex,
+                           u_char *key_hex, ngx_uint_t max);
+void      lsc_account(ngx_http_request_t *r, off_t delta);
 void      lsc_hex_encode(const u_char *bin, ngx_uint_t bin_len, u_char *hex);
 ngx_int_t lsc_safe_name(ngx_str_t *s);
 ngx_int_t lsc_mkpath(u_char *path, mode_t mode, ngx_log_t *log);
@@ -221,7 +254,12 @@ ngx_int_t lsc_purge_default_acl(ngx_conf_t *cf,
 ngx_int_t lsc_build_vary_string(ngx_http_request_t *r,
                                 ngx_str_t *vary_directive,
                                 ngx_str_t *out);
+/* NGX_DECLINED when the request carries nothing that tells one visitor
+ * from another: such a request never reads or writes the private cache. */
 ngx_int_t lsc_resolve_client_id(ngx_http_request_t *r, ngx_str_t *out);
+ngx_int_t lsc_default_vary(ngx_http_request_t *r, ngx_str_t *out);
+ngx_int_t lsc_get_cookie(ngx_http_request_t *r, ngx_str_t *name,
+                         ngx_str_t *out);
 
 /* module.c - request-counter for lscache_min_uses gating */
 ngx_uint_t lsc_bump_uses(u_char hex[LSC_KEY_HEX_LEN]);
@@ -231,8 +269,9 @@ ngx_uint_t lsc_bump_uses(u_char hex[LSC_KEY_HEX_LEN]);
  * request so fastcgi_pass / proxy_pass forwards it as HTTP_X_LSCACHE). */
 ngx_int_t lsc_advertise_protocol(ngx_http_request_t *r);
 
-/* storage.c - periodic eviction when over lscache_max_size */
-void      lsc_maybe_evict(ngx_http_request_t *r);
+/* storage.c - bounded background sweep: expired entries, and anything
+ * when the cache is over lscache_max_size */
+void      lsc_maintain(ngx_http_request_t *r);
 
 
 #endif /* _NGX_HTTP_LSCACHE_MODULE_H_ */

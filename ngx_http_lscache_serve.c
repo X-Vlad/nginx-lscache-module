@@ -8,14 +8,20 @@
  *   1. If PURGE method: hand to lsc_purge_handler.
  *   2. Only GET / HEAD are eligible for serving.
  *   3. Check bypass complex value; if set, mark BYPASS and decline.
- *   4. Compute base_key = SHA1(scheme + host + uri + args + "" + "").
- *      Try direct lookup at data/<base_key>: covers the simple no-vary case.
- *   5. Otherwise walk vary/<base_key>/, and for each candidate hex key:
+ *   4. Compute the fast key: host + URL + this request's default vary
+ *      (the _lscache_vary cookie, lscache_vary_extra), no vary directive,
+ *      no client id. Try data/<fast_key>: the usual public page. A
+ *      private entry is never served here.
+ *   5. Otherwise walk vary/<base_key>/ (base_key: host + URL only), at
+ *      most lscache_max_variants candidates, and for each hex key:
  *        a. Read its .meta sidecar.
  *        b. Pull the original "vary_directive" line.
  *        c. Build vary_string with current request + that directive.
- *        d. If the entry is private, resolve client_id from this request.
+ *        d. If the entry is private, resolve client_id from this request
+ *           (no identity: skip the entry).
  *        e. Recompute key; if it equals the candidate filename, serve it.
+ *      An entry is served only with its .meta and only when the data
+ *      file has the size its header states.
  *   6. NGX_DECLINED on miss -> request continues to fastcgi / proxy / static.
  *
  * Serve uses an `in_file` buf with file_pos=24 (skip the LSC1 header), so
@@ -168,8 +174,64 @@ lsc_decode_hdr(u_char hdr[24], lsc_file_hdr_t *out)
  * propagate). Returns NGX_DECLINED if entry was missing / expired / corrupt.
  * ═══════════════════════════════════════════════════════════════════════ */
 
+/* Put the stored "hdr Name: value" lines back on the response. The
+ * strings stay in the meta buffer, which lives as long as the request. */
 static ngx_int_t
-lsc_serve_entry(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx, u_char *hex)
+lsc_replay_headers(ngx_http_request_t *r, u_char *buf, size_t n)
+{
+    u_char          *line, *end, *eol, *colon;
+    ngx_table_elt_t *h;
+    ngx_str_t        value;
+    size_t           klen;
+
+    line = buf;
+    end  = buf + n;
+    while (line < end) {
+        eol = (u_char *) ngx_strlchr(line, end, '\n');
+        if (eol == NULL) eol = end;
+
+        if (eol - line > 4 && ngx_strncmp(line, "hdr ", 4) == 0) {
+            line += 4;
+            colon = (u_char *) ngx_strlchr(line, eol, ':');
+            if (colon != NULL && colon > line && colon + 2 <= eol
+                && colon[1] == ' ')
+            {
+                klen       = colon - line;
+                value.data = colon + 2;
+                value.len  = eol - value.data;
+                h = lsc_push_header(r, (char *) line, klen, &value);
+                if (h == NULL) return NGX_ERROR;
+
+                if (klen == 8
+                    && ngx_strncasecmp(line, (u_char *) "Location", 8) == 0)
+                {
+                    r->headers_out.location = h;
+                } else if (klen == 7
+                    && ngx_strncasecmp(line, (u_char *) "Expires", 7) == 0)
+                {
+                    r->headers_out.expires = h;
+#if (nginx_version >= 1023000)
+                } else if (klen == 13
+                    && ngx_strncasecmp(line, (u_char *) "Cache-Control", 13)
+                       == 0)
+                {
+                    ngx_table_elt_t **ph;
+                    for (ph = &r->headers_out.cache_control; *ph;
+                         ph = &(*ph)->next) { /* void */ }
+                    *ph = h;
+#endif
+                }
+            }
+        }
+        line = eol + 1;
+    }
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+lsc_serve_entry(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx, u_char *hex,
+    int allow_private)
 {
     ngx_http_lsc_main_conf_t *mcf;
     ngx_str_t                 dpath;
@@ -186,6 +248,10 @@ lsc_serve_entry(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx, u_char *hex)
     ngx_pool_cleanup_file_t  *clnf;
     ngx_chain_t               out;
     ngx_int_t                 rc;
+    struct stat               dst;
+    ngx_str_t                 sv;
+
+    ngx_memzero(&m, sizeof(m));
 
     mcf = ngx_http_get_module_main_conf(r, ngx_http_lscache_module);
     if (lsc_data_path(r->pool, &mcf->path, hex, &dpath) != NGX_OK) {
@@ -198,7 +264,13 @@ lsc_serve_entry(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx, u_char *hex)
     if (ngx_read_fd(fd, hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)
         || lsc_decode_hdr(hdr, &fh) != NGX_OK
         || (time_t)fh.expires <= ngx_time()
-        || (fh.flags & LSC_FF_STALE))
+        || (fh.flags & LSC_FF_STALE)
+        /* a private entry is reached only through the variant walk,
+         * which has checked whose it is */
+        || ((fh.flags & LSC_FF_PRIVATE) && !allow_private)
+        /* a file cut short (crash, full disk) is not an entry */
+        || fstat(fd, &dst) != 0
+        || dst.st_size != (off_t) fh.body_len + LSC_FILE_HEADER_BYTES)
     {
         /* fresh, valid entries serve; stale-flagged entries fall through
          * to upstream so the next response captures and overwrites them. */
@@ -206,7 +278,14 @@ lsc_serve_entry(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx, u_char *hex)
         return NGX_DECLINED;
     }
 
-    (void) lsc_load_meta(r, hex, &m, &meta_buf, &meta_n);
+    /* no meta, no entry: the meta holds the headers and says whether
+     * the entry is private */
+    if (lsc_load_meta(r, hex, &m, &meta_buf, &meta_n) != NGX_OK
+        || (m.is_private && !allow_private))
+    {
+        ngx_close_file(fd);
+        return NGX_DECLINED;
+    }
 
     /* build response headers */
     r->headers_out.status = fh.status ? fh.status : NGX_HTTP_OK;
@@ -222,15 +301,16 @@ lsc_serve_entry(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx, u_char *hex)
         }
     }
 
-    h = ngx_list_push(&r->headers_out.headers);
-    if (h == NULL) { ngx_close_file(fd); return NGX_ERROR; }
-    h->hash = 1;
-    ngx_str_set(&h->key, "X-LiteSpeed-Cache");
-    if (fh.flags & LSC_FF_PRIVATE) {
-        ngx_str_set(&h->value, "hit,private");
-    } else {
-        ngx_str_set(&h->value, "hit,public");
+    if (lsc_replay_headers(r, meta_buf, (size_t) meta_n) != NGX_OK) {
+        ngx_close_file(fd);
+        return NGX_ERROR;
     }
+
+    if (fh.flags & LSC_FF_PRIVATE) { ngx_str_set(&sv, "hit,private"); }
+    else                           { ngx_str_set(&sv, "hit,public"); }
+    h = lsc_push_header(r, "X-LiteSpeed-Cache",
+                        sizeof("X-LiteSpeed-Cache") - 1, &sv);
+    if (h == NULL) { ngx_close_file(fd); return NGX_ERROR; }
 
     /* record hit state on the context so var handlers and the rest of the
      * filter chain can see it. (Done up front so debug headers can read
@@ -258,13 +338,10 @@ lsc_serve_entry(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx, u_char *hex)
         ngx_http_lsc_loc_conf_t *lcf =
             ngx_http_get_module_loc_conf(r, ngx_http_lscache_module);
         if (lcf && lcf->debug) {
-            ngx_table_elt_t *dh = ngx_list_push(&r->headers_out.headers);
-            if (dh) {
-                dh->hash = 1;
-                ngx_str_set(&dh->key, "X-LSCache-Debug-Key");
-                dh->value.data = ctx->key_hex;
-                dh->value.len  = LSC_KEY_HEX_LEN;
-            }
+            sv.data = ctx->key_hex;
+            sv.len  = LSC_KEY_HEX_LEN;
+            (void) lsc_push_header(r, "X-LSCache-Debug-Key",
+                                   sizeof("X-LSCache-Debug-Key") - 1, &sv);
             if (m.vary_directive.len > 0) {
                 u_char *safe = ngx_pnalloc(r->pool, m.vary_directive.len);
                 if (safe != NULL) {
@@ -274,13 +351,11 @@ lsc_serve_entry(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx, u_char *hex)
                         if (c < 0x20 || c == 0x7F) c = ' ';
                         safe[k] = c;
                     }
-                    dh = ngx_list_push(&r->headers_out.headers);
-                    if (dh) {
-                        dh->hash = 1;
-                        ngx_str_set(&dh->key, "X-LSCache-Debug-Vary");
-                        dh->value.data = safe;
-                        dh->value.len  = m.vary_directive.len;
-                    }
+                    sv.data = safe;
+                    sv.len  = m.vary_directive.len;
+                    (void) lsc_push_header(r, "X-LSCache-Debug-Vary",
+                                           sizeof("X-LSCache-Debug-Vary") - 1,
+                                           &sv);
                 }
             }
         }
@@ -290,13 +365,10 @@ lsc_serve_entry(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx, u_char *hex)
         u_char *cb = ngx_pnalloc(r->pool, m.lsc_cookie.len);
         if (cb) {
             ngx_memcpy(cb, m.lsc_cookie.data, m.lsc_cookie.len);
-            h = ngx_list_push(&r->headers_out.headers);
-            if (h) {
-                h->hash = 1;
-                ngx_str_set(&h->key, "Set-Cookie");
-                h->value.data = cb;
-                h->value.len  = m.lsc_cookie.len;
-            }
+            sv.data = cb;
+            sv.len  = m.lsc_cookie.len;
+            (void) lsc_push_header(r, "Set-Cookie", sizeof("Set-Cookie") - 1,
+                                   &sv);
         }
     }
 
@@ -376,16 +448,18 @@ lsc_try_variant(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx,
         }
     }
     if (m.is_private) {
-        (void) lsc_resolve_client_id(r, &client_id);
+        if (lsc_resolve_client_id(r, &client_id) != NGX_OK) {
+            return NGX_DECLINED;   /* a visitor we cannot tell apart */
+        }
     }
 
-    lsc_compute_key(r, &vary_string, &client_id, candidate_bin);
+    lsc_compute_key(r, &vary_string, &client_id, 1, candidate_bin);
     lsc_hex_encode(candidate_bin, LSC_KEY_BIN_LEN, candidate_hex);
 
     if (ngx_memcmp(candidate_hex, variant_hex, LSC_KEY_HEX_LEN) != 0) {
         return NGX_DECLINED;
     }
-    return lsc_serve_entry(r, ctx, variant_hex);
+    return lsc_serve_entry(r, ctx, variant_hex, 1);
 }
 
 
@@ -403,6 +477,9 @@ lsc_precontent_handler(ngx_http_request_t *r)
     ngx_str_t                 bypass_val;
     u_char                    base_bin[LSC_KEY_BIN_LEN];
     u_char                    base_hex[LSC_KEY_HEX_LEN];
+    u_char                    fast_bin[LSC_KEY_BIN_LEN];
+    u_char                    fast_hex[LSC_KEY_HEX_LEN];
+    ngx_uint_t                tried = 0;
     ngx_int_t                 rc;
     u_char                    vdir_buf[LSC_PATH_MAX];
     u_char                   *vp;
@@ -455,14 +532,17 @@ lsc_precontent_handler(ngx_http_request_t *r)
         }
     }
 
-    /* base key = SHA1(scheme | host | uri | args | "" | "") */
-    lsc_compute_key(r, &empty, &empty, base_bin);
+    /* index key: host + URL only; names the folder of this URL's
+     * variants */
+    lsc_compute_key(r, &empty, &empty, 0, base_bin);
     lsc_hex_encode(base_bin, LSC_KEY_BIN_LEN, base_hex);
     ngx_memcpy(ctx->base_key_hex, base_hex, LSC_KEY_HEX_LEN);
 
-    /* fast path: try the base key directly (covers the no-vary, no-private
-     * common case where key == base_key) */
-    rc = lsc_serve_entry(r, ctx, base_hex);
+    /* fast path: the public entry stored without X-LiteSpeed-Vary for
+     * this request's default vary (the usual case) */
+    lsc_compute_key(r, &empty, &empty, 1, fast_bin);
+    lsc_hex_encode(fast_bin, LSC_KEY_BIN_LEN, fast_hex);
+    rc = lsc_serve_entry(r, ctx, fast_hex, 0);
     if (rc != NGX_DECLINED) return rc;
 
     /* slow path: walk vary/<base>/ and try each variant */
@@ -490,8 +570,12 @@ lsc_precontent_handler(ngx_http_request_t *r)
         if (nl != LSC_KEY_HEX_LEN) continue;
         raw = ngx_de_name(&d);
 
-        /* same as base? already tried */
-        if (ngx_memcmp(raw, base_hex, LSC_KEY_HEX_LEN) == 0) continue;
+        /* the fast-path key was tried already */
+        if (ngx_memcmp(raw, fast_hex, LSC_KEY_HEX_LEN) == 0) continue;
+
+        /* the store side keeps the folder within lscache_max_variants;
+         * never read more than that many metas for one request */
+        if (++tried > lcf->max_variants) break;
 
         for (i = 0; i < LSC_KEY_HEX_LEN; i++) {
             u_char c = raw[i];

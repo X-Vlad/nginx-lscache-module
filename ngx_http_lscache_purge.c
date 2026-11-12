@@ -244,12 +244,7 @@ lsc_purge_block(ngx_http_request_t *r, u_char *block_start, u_char *block_end,
 
     mcf = ngx_http_get_module_main_conf(r, ngx_http_lscache_module);
 
-    host.len = 0; host.data = NULL;
-    if (r->headers_in.host && r->headers_in.host->value.len > 0) {
-        host = r->headers_in.host->value;
-    } else if (r->headers_in.server.len > 0) {
-        host = r->headers_in.server;
-    }
+    lsc_request_host(r, &host);
     /* For inline purges (driven by an upstream response), restrict
      * tag, url and asterisk purges to entries matching this Host. This
      * prevents a compromised tenant's PHP plugin from wiping other
@@ -392,9 +387,9 @@ lsc_purge_block(ngx_http_request_t *r, u_char *block_start, u_char *block_end,
 
             {
                 ngx_str_t empty = ngx_null_string;
-                lsc_compute_key_full(r->pool, is_https, &host,
+                lsc_compute_key_full(is_https, &host,
                                      &uri_part, &args_part,
-                                     &empty, &empty, base_bin);
+                                     &empty, &empty, &empty, base_bin);
             }
             lsc_hex_encode(base_bin, LSC_KEY_BIN_LEN, base_hex);
 
@@ -587,14 +582,14 @@ lsc_purge_handler(ngx_http_request_t *r)
     r->headers_out.content_length_n = 0;
     r->header_only = 1;
 
-    resp_hdr = ngx_list_push(&r->headers_out.headers);
-    if (resp_hdr == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    resp_hdr->hash = 1;
-    ngx_str_set(&resp_hdr->key, "X-LiteSpeed-Purge-OK");
     buf = ngx_pnalloc(r->pool, NGX_INT_T_LEN);
     if (buf == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    resp_hdr->value.data = buf;
-    resp_hdr->value.len  = ngx_sprintf(buf, "%ui", count) - buf;
+    header_value.data = buf;
+    header_value.len  = ngx_sprintf(buf, "%ui", count) - buf;
+    resp_hdr = lsc_push_header(r, "X-LiteSpeed-Purge-OK",
+                               sizeof("X-LiteSpeed-Purge-OK") - 1,
+                               &header_value);
+    if (resp_hdr == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
 
     rc = ngx_http_send_header(r);
     if (rc == NGX_ERROR || rc > NGX_OK) return rc;

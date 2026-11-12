@@ -5,7 +5,7 @@
 Native C nginx module that speaks the LiteSpeed Cache plugin protocol.
 Lets nginx serve WordPress / Drupal / Magento sites that ship with an
 LSCache plugin as full-page cached, no LiteSpeed Web Server needed.
-Linux only. Tested on nginx 1.24.0, 1.28.2, 1.30.1.
+Linux only. Tested on nginx 1.24.0, 1.28.3, 1.30.1.
 
 ## Build
 
@@ -58,6 +58,18 @@ In production with real PHP-FPM this is automatic.
 - ASCII only in source files; native English in comments
 
 ## Security (don't regress these)
+
+- Host for keys, index and purge scope: `lsc_request_host()` (what nginx
+  routed by), never `r->headers_in.host` (t/19).
+- Private client id = address + all cookies but the stripped ones; no
+  cookie, no private cache. `_lscache_vary` is in every key (t/22).
+- `.meta` buffer: every variable length is summed, caps on each protocol
+  value; add a field, add it to the sum (t/20).
+- One owner per descriptor: the pool cleanup reads `ctx`, no copies (t/24).
+- Order of a store: meta, index markers, then the data file. Serve only
+  with meta and with the size the header states (t/23).
+- Only GET answers are stored; no 1xx/204/206/304; no backend
+  Content-Encoding; response headers are stored, Set-Cookie never (t/21).
 
 - `PURGE` gated by `lscache_purge_allowed`; v4-mapped IPv6 is matched as v4.
 - Public response with `Set-Cookie` is refused unless `LSC-Cookie` is

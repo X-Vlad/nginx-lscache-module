@@ -15,6 +15,7 @@ static ngx_int_t lsc_postconfigure(ngx_conf_t *cf);
 static void     *lsc_create_main_conf(ngx_conf_t *cf);
 static char     *lsc_init_main_conf(ngx_conf_t *cf, void *conf);
 static void     *lsc_create_loc_conf(ngx_conf_t *cf);
+static ngx_int_t lsc_stat_zone_init(ngx_shm_zone_t *shm_zone, void *data);
 static char     *lsc_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child);
 
 static char     *lsc_set_methods(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -106,6 +107,20 @@ static ngx_command_t lsc_commands[] = {
       offsetof(ngx_http_lsc_loc_conf_t, no_cache),
       NULL },
 
+    { ngx_string("lscache_vary_extra"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      lsc_set_complex,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_lsc_loc_conf_t, vary_extra),
+      NULL },
+
+    { ngx_string("lscache_max_variants"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_lsc_loc_conf_t, max_variants),
+      NULL },
+
     { ngx_string("lscache_strip_cookies"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
       lsc_set_strip_cookies,
@@ -173,7 +188,39 @@ lsc_init_main_conf(ngx_conf_t *cf, void *conf)
         mcf->max_size = (off_t)1024 * 1024 * 1024;
     }
     if (lsc_purge_default_acl(cf, mcf) != NGX_OK) return NGX_CONF_ERROR;
+
+    if (mcf->path.len > 0) {
+        ngx_str_t name = ngx_string("lscache_stat");
+        mcf->stat_zone = ngx_shared_memory_add(cf, &name, 8 * ngx_pagesize,
+                                               &ngx_http_lscache_module);
+        if (mcf->stat_zone == NULL) return NGX_CONF_ERROR;
+        mcf->stat_zone->init = lsc_stat_zone_init;
+    }
     return NGX_CONF_OK;
+}
+
+
+static ngx_int_t
+lsc_stat_zone_init(ngx_shm_zone_t *shm_zone, void *data)
+{
+    ngx_slab_pool_t *shpool;
+    lsc_shared_t    *sh;
+
+    if (data) {                 /* reload: keep the counters */
+        shm_zone->data = data;
+        return NGX_OK;
+    }
+    shpool = (ngx_slab_pool_t *) shm_zone->shm.addr;
+    if (shm_zone->shm.exists) {
+        shm_zone->data = shpool->data;
+        return NGX_OK;
+    }
+    sh = ngx_slab_alloc(shpool, sizeof(lsc_shared_t));
+    if (sh == NULL) return NGX_ERROR;
+    ngx_memzero(sh, sizeof(lsc_shared_t));
+    shpool->data   = sh;
+    shm_zone->data = sh;
+    return NGX_OK;
 }
 
 
@@ -186,6 +233,7 @@ lsc_create_loc_conf(ngx_conf_t *cf)
     conf->enable   = NGX_CONF_UNSET;
     conf->debug    = NGX_CONF_UNSET;
     conf->min_uses = NGX_CONF_UNSET_UINT;
+    conf->max_variants = NGX_CONF_UNSET_UINT;
     conf->min_age  = NGX_CONF_UNSET;
     conf->max_age  = NGX_CONF_UNSET;
     return conf;
@@ -201,6 +249,9 @@ lsc_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
     ngx_conf_merge_value(conf->debug,  prev->debug,  0);
     ngx_conf_merge_uint_value(conf->min_uses, prev->min_uses, 1);
+    ngx_conf_merge_uint_value(conf->max_variants, prev->max_variants, 64);
+    if (conf->max_variants < 1) conf->max_variants = 1;
+    if (conf->vary_extra == NULL) conf->vary_extra = prev->vary_extra;
     ngx_conf_merge_sec_value(conf->min_age, prev->min_age, 1);
     ngx_conf_merge_sec_value(conf->max_age, prev->max_age, 86400);
 
@@ -234,6 +285,25 @@ lsc_ensure_ctx(ngx_http_request_t *r)
     ctx->status = LSC_ST_NONE;
     ngx_http_set_ctx(r, ctx, ngx_http_lscache_module);
     return ctx;
+}
+
+
+/* Push one response header with every field set (ngx_list_push hands
+ * back raw memory, and newer nginx has a `next` pointer in there). */
+ngx_table_elt_t *
+lsc_push_header(ngx_http_request_t *r, const char *key, size_t key_len,
+    ngx_str_t *value)
+{
+    ngx_table_elt_t *h;
+
+    h = ngx_list_push(&r->headers_out.headers);
+    if (h == NULL) return NULL;
+    ngx_memzero(h, sizeof(ngx_table_elt_t));
+    h->hash     = 1;
+    h->key.data = (u_char *) key;
+    h->key.len  = key_len;
+    h->value    = *value;
+    return h;
 }
 
 
@@ -304,12 +374,12 @@ lsc_set_methods(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         } else if (m->len == 4
                    && ngx_strncasecmp(m->data, (u_char *)"HEAD", 4) == 0) {
             lcf->methods_bitmap |= NGX_HTTP_HEAD;
-        } else if (m->len == 4
-                   && ngx_strncasecmp(m->data, (u_char *)"POST", 4) == 0) {
-            lcf->methods_bitmap |= NGX_HTTP_POST;
         } else {
+            /* POST is refused on purpose: the key has no method and no
+             * body in it, so a stored POST answer would be served to
+             * every later GET of the same URL. */
             ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
-                "lscache: unsupported method \"%V\" (use GET, HEAD, or POST)",
+                "lscache: unsupported method \"%V\" ignored (use GET, HEAD)",
                 m);
         }
     }

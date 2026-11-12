@@ -56,6 +56,10 @@ core
 core.*
 vgcore.*
 
+# Test pages made by t/run_tests.sh
+t/htdocs/
+t/htdocs-b/
+
 # Demo - CMS installations (heavy, local-only)
 demo/www/wordpress/
 demo/www/joomla/

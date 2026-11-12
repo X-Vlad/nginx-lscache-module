@@ -1,7 +1,15 @@
 ngx_addon_name=ngx_http_lscache_module
 
 if test -n "$ngx_module_link"; then
-    ngx_module_type=HTTP
+    # Dynamic: loaded after every built-in module, so its filters are
+    # already first in the chain. Static: it must be listed among the
+    # filter modules, or its header and body filters sit below nginx's
+    # own header filter and are never called.
+    if test "$ngx_module_link" = DYNAMIC; then
+        ngx_module_type=HTTP
+    else
+        ngx_module_type=HTTP_AUX_FILTER
+    fi
     ngx_module_name=ngx_http_lscache_module
     ngx_module_srcs="$ngx_addon_dir/ngx_http_lscache_module.c \
                      $ngx_addon_dir/ngx_http_lscache_filter.c \
@@ -13,7 +21,10 @@ if test -n "$ngx_module_link"; then
 
     . auto/module
 else
-    HTTP_MODULES="$HTTP_MODULES ngx_http_lscache_module"
+    # A static build must sit among the filters: listed as a plain HTTP
+    # module its header and body filters end up below nginx's own header
+    # filter and are never called.
+    HTTP_AUX_FILTER_MODULES="$HTTP_AUX_FILTER_MODULES ngx_http_lscache_module"
     NGX_ADDON_SRCS="$NGX_ADDON_SRCS \
                     $ngx_addon_dir/ngx_http_lscache_module.c \
                     $ngx_addon_dir/ngx_http_lscache_filter.c \

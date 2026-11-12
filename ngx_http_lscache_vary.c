@@ -16,12 +16,7 @@
  *   4. Sort segments lexicographically by NAME so the order of the
  *      cookie= / value= tokens in the directive doesn't change the key.
  *
- * Private client id resolution (called when ctx->is_private):
- *   First non-empty wins, in priority order:
- *     1. Cookie "_lscache_vary"   (the WP plugin sets this)
- *     2. Cookie "wp_session"
- *     3. Cookie "PHPSESSID"
- *     4. r->connection->addr_text (remote IP, fallback)
+ * Private client id and default vary: see the comments at the functions.
  */
 
 #include "ngx_http_lscache_module.h"
@@ -33,7 +28,7 @@
  * releases, and we want one build to work across 1.24 / 1.28 / 1.30.
  * ═══════════════════════════════════════════════════════════════════════ */
 
-static ngx_int_t
+ngx_int_t
 lsc_get_cookie(ngx_http_request_t *r, ngx_str_t *name, ngx_str_t *out)
 {
     ngx_list_part_t *part;
@@ -291,31 +286,166 @@ lsc_build_vary_string(ngx_http_request_t *r, ngx_str_t *vary_directive,
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Private cache: resolve a client identifier.
+ * Private cache: who is this visitor?
+ *
+ * The id is the client address plus every cookie of the request (name
+ * and value, in the order sent), without the cookies named in
+ * lscache_strip_cookies. A single well-known cookie is not enough:
+ * _lscache_vary holds the same value for every user of one role, and an
+ * address alone is shared by everyone behind one NAT. A request without
+ * any cookie that counts has no identity, and the private cache is
+ * neither read nor written for it (NGX_DECLINED).
  * ═══════════════════════════════════════════════════════════════════════ */
+
+static ngx_uint_t
+lsc_cookie_stripped(ngx_http_lsc_loc_conf_t *lcf, u_char *name, size_t len)
+{
+    ngx_str_t  *names;
+    ngx_uint_t  k;
+
+    if (lcf == NULL || lcf->strip_cookies == NULL) return 0;
+    names = lcf->strip_cookies->elts;
+    for (k = 0; k < lcf->strip_cookies->nelts; k++) {
+        if (names[k].len == len
+            && ngx_strncasecmp(names[k].data, name, len) == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 
 ngx_int_t
 lsc_resolve_client_id(ngx_http_request_t *r, ngx_str_t *out)
 {
-    static const struct {
-        const char *name;
-        size_t      len;
-    } candidates[] = {
-        { "_lscache_vary", 13 },
-        { "wp_session",    10 },
-        { "PHPSESSID",      9 },
-    };
-    ngx_uint_t i;
-    ngx_str_t  name, value;
+    ngx_http_lsc_loc_conf_t *lcf;
+    ngx_list_part_t         *part;
+    ngx_table_elt_t         *h;
+    ngx_uint_t               i, used = 0;
+    size_t                   cap;
+    u_char                  *p, *end, *kstart, *vstart, *o;
+    size_t                   klen, vlen;
 
-    for (i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
-        name.data = (u_char *) candidates[i].name;
-        name.len  = candidates[i].len;
-        if (lsc_get_cookie(r, &name, &value) == NGX_OK && value.len > 0) {
-            *out = value;
-            return NGX_OK;
+    out->data = NULL;
+    out->len  = 0;
+    lcf = ngx_http_get_module_loc_conf(r, ngx_http_lscache_module);
+
+    /* upper bound: address + '\n' + every Cookie header + one ';' and
+     * one '=' per pair (a pair is at least one byte long) */
+    cap  = r->connection->addr_text.len + 1;
+    part = &r->headers_in.headers.part;
+    h    = part->elts;
+    for (i = 0;; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) break;
+            part = part->next; h = part->elts; i = 0;
+        }
+        if (h[i].key.len == 6
+            && ngx_strncasecmp(h[i].key.data, (u_char *)"Cookie", 6) == 0)
+        {
+            cap += 3 * h[i].value.len + 2;
         }
     }
-    *out = r->connection->addr_text;
+
+    o = ngx_pnalloc(r->pool, cap);
+    if (o == NULL) return NGX_ERROR;
+    out->data = o;
+    o = ngx_cpymem(o, r->connection->addr_text.data,
+                   r->connection->addr_text.len);
+    *o++ = '\n';
+
+    part = &r->headers_in.headers.part;
+    h    = part->elts;
+    for (i = 0;; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) break;
+            part = part->next; h = part->elts; i = 0;
+        }
+        if (h[i].key.len != 6
+            || ngx_strncasecmp(h[i].key.data, (u_char *)"Cookie", 6) != 0)
+        {
+            continue;
+        }
+        p   = h[i].value.data;
+        end = p + h[i].value.len;
+        while (p < end) {
+            while (p < end && (*p == ' ' || *p == ';' || *p == '\t')) p++;
+            if (p >= end) break;
+            kstart = p;
+            while (p < end && *p != '=' && *p != ';') p++;
+            klen = p - kstart;
+            while (klen > 0 && (kstart[klen - 1] == ' '
+                                || kstart[klen - 1] == '\t'))
+                klen--;
+            vstart = p;
+            vlen   = 0;
+            if (p < end && *p == '=') {
+                p++;
+                vstart = p;
+                while (p < end && *p != ';') p++;
+                vlen = p - vstart;
+                while (vlen > 0 && (vstart[vlen - 1] == ' '
+                                    || vstart[vlen - 1] == '\t'
+                                    || vstart[vlen - 1] == '\r'))
+                    vlen--;
+            }
+            if (klen == 0 || lsc_cookie_stripped(lcf, kstart, klen)) continue;
+            o = ngx_cpymem(o, kstart, klen);
+            *o++ = '=';
+            o = ngx_cpymem(o, vstart, vlen);
+            *o++ = ';';
+            used++;
+        }
+    }
+
+    if (used == 0) {
+        out->data = NULL;
+        return NGX_DECLINED;
+    }
+    out->len = o - out->data;
+    return NGX_OK;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Default vary: what every key of this request carries without the
+ * backend asking for it. LiteSpeed always keys on the _lscache_vary
+ * cookie (the plugin sets it per role, for commenters and so on), and
+ * its .htaccess rules add more (mobile, webp). nginx has no .htaccess,
+ * so the operator gives that part as lscache_vary_extra.
+ *
+ * Result: "" when neither is present, else "<cookie>\n<extra>".
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+ngx_int_t
+lsc_default_vary(ngx_http_request_t *r, ngx_str_t *out)
+{
+    ngx_http_lsc_loc_conf_t *lcf;
+    ngx_str_t                name = ngx_string(LSC_DEFAULT_VARY_COOKIE);
+    ngx_str_t                cookie = ngx_null_string;
+    ngx_str_t                extra  = ngx_null_string;
+    u_char                  *p;
+
+    out->data = NULL;
+    out->len  = 0;
+
+    (void) lsc_get_cookie(r, &name, &cookie);
+
+    lcf = ngx_http_get_module_loc_conf(r, ngx_http_lscache_module);
+    if (lcf != NULL && lcf->vary_extra != NULL) {
+        if (ngx_http_complex_value(r, lcf->vary_extra, &extra) != NGX_OK) {
+            return NGX_ERROR;
+        }
+    }
+    if (cookie.len == 0 && extra.len == 0) return NGX_OK;
+
+    p = ngx_pnalloc(r->pool, cookie.len + 1 + extra.len);
+    if (p == NULL) return NGX_ERROR;
+    out->data = p;
+    p = ngx_cpymem(p, cookie.data, cookie.len);
+    *p++ = '\n';
+    p = ngx_cpymem(p, extra.data, extra.len);
+    out->len = p - out->data;
     return NGX_OK;
 }

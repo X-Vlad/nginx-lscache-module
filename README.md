@@ -50,9 +50,12 @@ Combined with the sibling [`ngx_http_htaccess_module`](https://github.com/X-Vlad
 |--------|--------|-------|
 | `X-LiteSpeed-Cache-Control` | Full | public, private, max-age=N, s-maxage=N, no-cache, no-store, no-vary, esi (ignored) |
 | `X-LiteSpeed-Tag` | Full | Comma list. `public:` prefix accepted and stripped. |
-| `X-LiteSpeed-Vary` | Full | `cookie=NAME`, `value=NAME` (resolved against `X-LSCache-Vary-NAME` request header) |
+| `X-LiteSpeed-Vary` | Full | `cookie=NAME`, `value=NAME` (resolved against `X-LSCache-Vary-NAME` request header). At most 1024 bytes; a longer one is passed on and the response is not stored. |
 | `X-LiteSpeed-Purge` (response form) | Full | Triggers an inline purge as a side effect of the request. |
-| `LSC-Cookie` | Full | Stored in `.meta`, replayed as `Set-Cookie` on every served response. |
+| `LSC-Cookie` | Full | Stored in `.meta`, replayed as `Set-Cookie` on every served response. At most 4096 bytes. |
+| Other response headers | Stored | `Location`, `Cache-Control`, `Content-Security-Policy`, `Link` and the rest are stored with the body and sent again on a hit (up to 16 KB in all; more than that and the response is not stored). Never stored: `Set-Cookie`, hop-by-hop headers, and what nginx makes itself (`Date`, `Server`, `Content-Length`, `ETag`, `Last-Modified`). |
+| `Content-Encoding` | Guarded | A body the backend already compressed is not stored (it fits only the clients that accept that encoding). Let nginx compress: `gzip on` works on hits. |
+| Status | Guarded | 1xx, 204, 206 and 304 answers are not stored. |
 | `Set-Cookie` | Guarded | Public response with `Set-Cookie` is refused (`no-cache`) unless `LSC-Cookie` is also present. |
 | `Vary` (RFC 7234) | Guarded | Accepted only when the value is empty or just `Accept-Encoding`. Anything else refuses caching. |
 
@@ -89,7 +92,10 @@ Send the `PURGE` HTTP method from an IP allowed by `lscache_purge_allowed`. Body
 
 - HIT path: `open()` the cache file, read a 24-byte header, send the body via `sendfile()` straight from disk. No user-space body buffers, no PHP-FPM round-trip.
 - WRITE path: capture upstream response into a tmp file, atomic `rename(2)` on completion. Concurrent writers cannot corrupt each other.
-- Size-based eviction runs in-band every ~100 writes per worker. No background thread, no shared memory, no extra processes.
+- No `fsync`: the cache can be rebuilt, and a data file whose size does not match its header is treated as a miss.
+- The total size lives in a small shared memory zone, kept by the store and purge paths (a full recount runs once after start and then hourly). Every 64 stores one worker sweeps the next `data/HH` folder and removes expired and damaged entries; while the cache is over `lscache_max_size` it goes on and removes live entries too, until the size is 10% under the limit. One sweep removes at most 2048 entries, so a worker is never held for long. Which live entries go depends on where the sweep is, not on their age.
+- A URL keeps at most `lscache_max_variants` variants (vary values plus private copies). A miss reads at most that many small `.meta` files.
+- Purging removes the index folders it empties (`tags/<tag>`, `hosts/<host>`, `vary/<key>`).
 - Entries are sharded by the first 4 hex chars of the SHA-1 key (two 2-char levels = up to 65 536 leaf dirs), so `readdir` stays fast at any cache size.
 
 ## Configuration
@@ -100,15 +106,17 @@ Send the `PURGE` HTTP method from an IP allowed by `lscache_purge_allowed`. Body
 |-----------|---------|---------|-------------|
 | `lscache` | http, server, location | `off` | Enable/disable for this scope |
 | `lscache_path <dir>` | http | (required when on) | Cache root. Must exist and be writable by the worker user. |
-| `lscache_max_size <size>` | http | `1g` | Soft cap on cache dir size. Eviction runs every ~100 writes. |
-| `lscache_methods <method>...` | http, server, location | `GET HEAD` | Methods eligible for caching. POST is opt-in. |
+| `lscache_max_size <size>` | http | `1g` | Soft cap on the size of the data files. See Performance for how it is kept. |
+| `lscache_methods <method>...` | http, server, location | `GET HEAD` | Methods served from the cache. Only a `GET` answer is ever stored. `POST` is refused (the key holds no method and no body). |
 | `lscache_min_uses <n>` | http, server, location | `1` | Cache only after the Nth request on the same base key (per worker). |
 | `lscache_min_age <seconds>` | http, server, location | `1` | Reject `max-age` lower than this. |
 | `lscache_max_age <seconds>` | http, server, location | `86400` | Cap `max-age` to this. |
 | `lscache_purge_allowed <CIDR>...` | http | `127.0.0.1 ::1` | IPs/CIDRs allowed to send `PURGE`. Supports IPv4, IPv6, CIDR, `all`. |
 | `lscache_bypass <var>` | http, server, location | none | If `$var` is non-empty/non-zero, skip cache lookup (proxy_cache_bypass parity). |
 | `lscache_no_cache <var>` | http, server, location | none | If `$var` is non-empty/non-zero, do not store the response. |
-| `lscache_strip_cookies <name>...` | http, server, location | none | Cookie names to drop from the cache key (e.g. analytics cookies). |
+| `lscache_strip_cookies <name>...` | http, server, location | none | Cookie names that never count: not as a vary value, and not as part of a visitor's identity for the private cache (e.g. analytics cookies `_ga _gid _fbp`). Set it, or the private cache will rarely hit. |
+| `lscache_vary_extra <value>` | http, server, location | none | Extra part of every key of the request (variables allowed). This is where LiteSpeed's `.htaccess` vary rules go, e.g. a `map` on `$http_user_agent` giving `ismobile`, or on `$http_accept` giving `webp`. |
+| `lscache_max_variants <n>` | http, server, location | `64` | Most variants one URL may have (1 to 256). At the limit expired ones are dropped; if none is, the new variant is passed on and not stored. |
 | `lscache_debug` | http, server, location | `off` | Emit `X-LSCache-Debug-Key` and `X-LSCache-Debug-Vary` response headers. **Never enable in production.** |
 
 ### Variables
@@ -185,6 +193,12 @@ http {
 
 ## Security
 
+- The host in a cache key is the name nginx chose the server by (`$host`), never the raw `Host` header. With an absolute request line (`GET http://a.example/ HTTP/1.1` plus `Host: b.example`) the two differ; a key built from the header would let site A write into, and purge, site B's cache.
+- The private cache belongs to one visitor: the key holds the client address and every cookie of the request except those in `lscache_strip_cookies`. A request without such a cookie neither reads nor writes it. (`_lscache_vary` alone is not an identity: the plugin gives every user of one role the same value.)
+- The `_lscache_vary` cookie is part of every key (LiteSpeed's default vary), so a guest's page is never served to a logged-in role or the other way round.
+- Every length that reaches the `.meta` record is counted before the buffer is made, and each protocol value has a cap; a response that does not fit is not stored.
+- An entry is served only with its `.meta` (it holds the headers and the private flag) and only when the data file has the size its header states. The `.meta` and the index markers are written before the data file appears.
+- A stored page is closed once. (A second close of a remembered descriptor number closes whatever got that number since, for example another visitor's connection.)
 - `PURGE` is gated by `lscache_purge_allowed`. Default is `127.0.0.1 ::1` only - without this an attacker could wipe any hosting customer's cache by sending a single HTTP request.
 - A response that carries `Set-Cookie` and is declared `public` is refused (`X-LiteSpeed-Cache: no-cache`) unless an `LSC-Cookie` is also present. This is the canonical session-leak guard: serving user A's `Set-Cookie` to user B is a session hijack vector.
 - An upstream `LSC-Cookie` value containing CR, LF or NUL is treated as a header-injection attempt: the response is refused for caching (`X-LiteSpeed-Cache: no-cache`) rather than smuggled into a `Set-Cookie` line on subsequent hits.
@@ -250,6 +264,8 @@ make docker-test                     # build the docker image, run all tests
 make && sudo make install
 ```
 
+A static build takes no `load_module` line. The module registers among nginx's filter modules there.
+
 ### Requirements
 
 - **Linux** (POSIX `rename(2)`, `mkdir`, `opendir`)
@@ -273,7 +289,7 @@ The whole `t/*.t.sh` suite is exercised against each release on every build:
 | Version | Status |
 |---------|--------|
 | 1.24.0 | green |
-| 1.28.2 | green |
+| 1.28.3 | green (also with AddressSanitizer, 4 workers under load) |
 | 1.30.1 (default in Dockerfile) | green |
 
 ## Testing
@@ -285,7 +301,11 @@ docker run --rm nginx-lscache-test bash /tests/t/stress.sh    # stress harness
 make test-versions                                            # whole nginx matrix
 ```
 
-`t/*.t.sh` covers every feature listed above. `t/stress.sh` drives the module with `ab` under concurrent PURGE storms and fails the run on any non-zero error rate, worker RSS growth above 8 MB, `[alert]`/`[crit]`/`[emerg]` in the error log, broken liveness probe, or a corrupted cache file.
+`t/*.t.sh` covers every feature listed above; `19` to `25` hold one test per security or reliability fix (cross-site keys, long headers, stored headers, private identity, variants and damaged files, double close, size limit), and the runner fails if a worker died or a sanitizer wrote a report. Outside Docker: `NGINX_BIN=... NGINX_PREFIX=... LSCACHE_ROOT=... bash t/run_tests.sh` (`NGINX_TEST_USER=root` when run as root).
+
+Upgrading from 1.0: the key and `.meta` formats changed, so empty `lscache_path` once.
+
+`t/*.t.sh` also has the older feature tests. `t/stress.sh` drives the module with `ab` under concurrent PURGE storms and fails the run on any non-zero error rate, worker RSS growth above 8 MB, `[alert]`/`[crit]`/`[emerg]` in the error log, broken liveness probe, or a corrupted cache file.
 
 `demo/` boots nginx + PHP-FPM + MySQL + the real WordPress LiteSpeed Cache plugin via Docker Compose; `demo/smoke-test.sh` asserts `miss` then `hit,public` against a sample post end-to-end. See [`demo/README.md`](demo/README.md).
 

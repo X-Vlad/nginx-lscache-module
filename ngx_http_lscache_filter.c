@@ -19,14 +19,18 @@
  *   - When ctx->capturing: open tmp_fd on first chunk, write a placeholder
  *     24-byte header, then mirror each in-memory / in-file buffer.
  *   - On last_buf: rewrite the header with real body_len + status + flags
- *     + expires, fsync, rename(2) to the final data path. Write .meta
- *     sidecar and back-reference index files (hosts/, tags/, vary/).
+ *     + expires. Then, in this order: write the .meta sidecar, the
+ *     index markers (hosts/, tags/, vary/), and last rename(2) the data
+ *     file into place, so nothing servable lacks its headers or its
+ *     purge markers.
  *   - On error or aborted request: unlink tmp via the cleanup handler.
  */
 
 #include "ngx_http_lscache_module.h"
 
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 
 static ngx_http_output_header_filter_pt  next_header_filter;
@@ -49,13 +53,11 @@ static ngx_int_t lsc_materialize_lsc_cookie(ngx_http_request_t *r,
     ngx_http_lsc_ctx_t *ctx);
 static ngx_int_t lsc_setup_capture(ngx_http_request_t *r,
     ngx_http_lsc_ctx_t *ctx);
-static void lsc_write_meta_and_refs(ngx_http_request_t *r,
+static ngx_int_t lsc_collect_headers(ngx_http_request_t *r,
     ngx_http_lsc_ctx_t *ctx);
-
-typedef struct {
-    ngx_fd_t  fd;
-    u_char   *path;
-} lsc_tmp_cleanup_t;
+static ngx_int_t lsc_write_meta(ngx_http_request_t *r,
+    ngx_http_lsc_ctx_t *ctx);
+static void lsc_write_refs(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx);
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -307,6 +309,21 @@ lsc_strip_and_collect(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx)
         {
             ctx->has_set_cookie = 1;
 
+        } else if (h[i].key.len == sizeof("Content-Encoding") - 1
+                   && ngx_strncasecmp(h[i].key.data,
+                       (u_char *)"Content-Encoding",
+                       sizeof("Content-Encoding") - 1) == 0)
+        {
+            /* A body the backend already encoded fits only the clients
+             * that accept that encoding. Not stored: nginx compresses
+             * the stored plain body itself, per client. */
+            if (!(h[i].value.len == 8
+                  && ngx_strncasecmp(h[i].value.data, (u_char *)"identity",
+                                     8) == 0))
+            {
+                ctx->has_content_encoding = 1;
+            }
+
         } else if (h[i].key.len == sizeof("Vary") - 1
                    && ngx_strncasecmp(h[i].key.data,
                        (u_char *)"Vary", sizeof("Vary") - 1) == 0)
@@ -354,16 +371,14 @@ static ngx_int_t
 lsc_emit_status_header(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx,
     int want_no_cache)
 {
-    ngx_table_elt_t *h;
+    ngx_str_t v;
 
-    h = ngx_list_push(&r->headers_out.headers);
-    if (h == NULL) return NGX_ERROR;
-    h->hash = 1;
-    ngx_str_set(&h->key, "X-LiteSpeed-Cache");
-    if (want_no_cache) {
-        ngx_str_set(&h->value, "no-cache");
-    } else {
-        ngx_str_set(&h->value, "miss");
+    if (want_no_cache) { ngx_str_set(&v, "no-cache"); }
+    else               { ngx_str_set(&v, "miss"); }
+    if (lsc_push_header(r, "X-LiteSpeed-Cache",
+                        sizeof("X-LiteSpeed-Cache") - 1, &v) == NULL)
+    {
+        return NGX_ERROR;
     }
     return NGX_OK;
 }
@@ -376,35 +391,148 @@ lsc_emit_status_header(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx,
 static ngx_int_t
 lsc_materialize_lsc_cookie(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx)
 {
-    ngx_table_elt_t *h;
-
     if (!ctx->has_lsc_cookie || ctx->lsc_cookie.len == 0) return NGX_OK;
 
-    h = ngx_list_push(&r->headers_out.headers);
-    if (h == NULL) return NGX_ERROR;
-    h->hash = 1;
-    ngx_str_set(&h->key, "Set-Cookie");
-    h->value = ctx->lsc_cookie;
+    if (lsc_push_header(r, "Set-Cookie", sizeof("Set-Cookie") - 1,
+                        &ctx->lsc_cookie) == NULL)
+    {
+        return NGX_ERROR;
+    }
     return NGX_OK;
 }
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Cleanup handler: removes tmp file if the request died before finalize.
+ *
+ * It looks at the context, never at a copy of the descriptor: the body
+ * filter closes the file itself on success, and a second close of a
+ * remembered number would close whatever got that number since (another
+ * visitor's socket, for one).
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static void
 lsc_tmp_cleanup(void *data)
 {
-    lsc_tmp_cleanup_t *c = data;
-    if (c->fd != NGX_INVALID_FILE) {
-        ngx_close_file(c->fd);
-        c->fd = NGX_INVALID_FILE;
+    ngx_http_lsc_ctx_t *ctx = *(ngx_http_lsc_ctx_t **) data;
+
+    if (ctx->tmp_fd != NGX_INVALID_FILE) {
+        ngx_close_file(ctx->tmp_fd);
+        ctx->tmp_fd = NGX_INVALID_FILE;
     }
-    if (c->path) {
-        (void) ngx_delete_file(c->path);
-        c->path = NULL;
+    if (ctx->tmp_path) {
+        (void) ngx_delete_file(ctx->tmp_path);
+        ctx->tmp_path = NULL;
     }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Which response headers go into the cache with the body.
+ *
+ * Everything the backend sent, except: what nginx makes itself on every
+ * answer, hop-by-hop headers, the protocol's own headers, and
+ * Set-Cookie (a cookie is one visitor's; LSC-Cookie is the shared one).
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static ngx_uint_t
+lsc_header_skipped(ngx_str_t *key)
+{
+    static ngx_str_t exact[] = {
+        ngx_string("Set-Cookie"),        ngx_string("Date"),
+        ngx_string("Server"),            ngx_string("Connection"),
+        ngx_string("Keep-Alive"),        ngx_string("Transfer-Encoding"),
+        ngx_string("Content-Length"),    ngx_string("Content-Type"),
+        ngx_string("Content-Encoding"),  ngx_string("Content-Range"),
+        ngx_string("Last-Modified"),     ngx_string("ETag"),
+        ngx_string("Accept-Ranges"),     ngx_string("Age"),
+        ngx_string("Upgrade"),           ngx_string("Trailer"),
+        ngx_string("TE"),                ngx_string("LSC-Cookie"),
+        ngx_string("Proxy-Authenticate"),
+        ngx_string("Proxy-Authorization"),
+        ngx_string("WWW-Authenticate"),
+        ngx_null_string
+    };
+    static ngx_str_t prefix[] = {
+        ngx_string("X-LiteSpeed-"), ngx_string("X-LSCache"),
+        ngx_string("X-Accel-"),
+        ngx_null_string
+    };
+    ngx_uint_t i;
+
+    for (i = 0; exact[i].len; i++) {
+        if (key->len == exact[i].len
+            && ngx_strncasecmp(key->data, exact[i].data, key->len) == 0)
+        {
+            return 1;
+        }
+    }
+    for (i = 0; prefix[i].len; i++) {
+        if (key->len >= prefix[i].len
+            && ngx_strncasecmp(key->data, prefix[i].data, prefix[i].len) == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+
+/* Builds ctx->hdr_block ("hdr Name: value\n" lines). NGX_DECLINED when
+ * the headers do not fit or hold bytes a meta line cannot carry: the
+ * response is then not stored at all, never stored without them. */
+static ngx_int_t
+lsc_collect_headers(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx)
+{
+    ngx_list_part_t *part;
+    ngx_table_elt_t *h;
+    ngx_uint_t       i, k, pass;
+    size_t           total = 0;
+    u_char          *p = NULL;
+
+    for (pass = 0; pass < 2; pass++) {
+        part = &r->headers_out.headers.part;
+        h    = part->elts;
+        for (i = 0;; i++) {
+            if (i >= part->nelts) {
+                if (part->next == NULL) break;
+                part = part->next; h = part->elts; i = 0;
+            }
+            if (h[i].hash == 0 || h[i].key.len == 0) continue;
+            if (lsc_header_skipped(&h[i].key)) continue;
+
+            if (pass == 0) {
+                for (k = 0; k < h[i].key.len; k++) {
+                    u_char c = h[i].key.data[k];
+                    if (c <= 0x20 || c >= 0x7F || c == ':') {
+                        return NGX_DECLINED;
+                    }
+                }
+                for (k = 0; k < h[i].value.len; k++) {
+                    u_char c = h[i].value.data[k];
+                    if (c == '\r' || c == '\n' || c == '\0') {
+                        return NGX_DECLINED;
+                    }
+                }
+                total += 4 + h[i].key.len + 2 + h[i].value.len + 1;
+                if (total > LSC_HEADER_BLOCK_MAX) return NGX_DECLINED;
+            } else {
+                p = ngx_cpymem(p, "hdr ", 4);
+                p = ngx_cpymem(p, h[i].key.data, h[i].key.len);
+                *p++ = ':'; *p++ = ' ';
+                p = ngx_cpymem(p, h[i].value.data, h[i].value.len);
+                *p++ = '\n';
+            }
+        }
+        if (pass == 0) {
+            if (total == 0) return NGX_OK;
+            ctx->hdr_block.data = ngx_pnalloc(r->pool, total);
+            if (ctx->hdr_block.data == NULL) return NGX_DECLINED;
+            p = ctx->hdr_block.data;
+        }
+    }
+    ctx->hdr_block.len = p - ctx->hdr_block.data;
+    return NGX_OK;
 }
 
 
@@ -419,15 +547,26 @@ static ngx_int_t
 lsc_setup_capture(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx)
 {
     ngx_http_lsc_main_conf_t *mcf;
+    ngx_http_lsc_loc_conf_t  *lcf;
     ngx_str_t                 vary_string = ngx_null_string;
     ngx_str_t                 client_id   = ngx_null_string;
     ngx_str_t                 empty       = ngx_null_string;
     u_char                    base_bin[LSC_KEY_BIN_LEN];
     ngx_pool_cleanup_t       *cln;
-    lsc_tmp_cleanup_t        *cln_data;
 
     mcf = ngx_http_get_module_main_conf(r, ngx_http_lscache_module);
+    lcf = ngx_http_get_module_loc_conf(r, ngx_http_lscache_module);
     if (mcf->path.len == 0) return NGX_DECLINED;
+
+    /* the host is part of the key and of the index; without one (an
+     * HTTP/1.0 request with no Host) nothing is stored */
+    lsc_request_host(r, &ctx->host);
+    if (ctx->host.len == 0 || ctx->host.len > 255
+        || lsc_safe_name(&ctx->host) != NGX_OK)
+    {
+        ctx->host.len = 0;
+        return NGX_DECLINED;
+    }
 
     if (ctx->vary_directive.len > 0
         && !(ctx->cc_flags & LSC_CC_NO_VARY))
@@ -439,18 +578,28 @@ lsc_setup_capture(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx)
         }
     }
     if (ctx->is_private) {
-        (void) lsc_resolve_client_id(r, &client_id);
+        if (lsc_resolve_client_id(r, &client_id) != NGX_OK) {
+            return NGX_DECLINED;       /* a visitor we cannot tell apart */
+        }
     }
     ctx->vary_string = vary_string;
     ctx->client_id   = client_id;
 
-    lsc_compute_key(r, &vary_string, &client_id, ctx->key_bin);
+    lsc_compute_key(r, &vary_string, &client_id, 1, ctx->key_bin);
     lsc_hex_encode(ctx->key_bin, LSC_KEY_BIN_LEN, ctx->key_hex);
 
-    /* base key: same inputs except empty vary_string + empty client_id;
-     * used as the index for "purge all variants of this URL" */
-    lsc_compute_key(r, &empty, &empty, base_bin);
+    /* index key: host + URL only; names the folder that lists every
+     * variant of this URL ("purge this URL", the lookup walk) */
+    lsc_compute_key(r, &empty, &empty, 0, base_bin);
     lsc_hex_encode(base_bin, LSC_KEY_BIN_LEN, ctx->base_key_hex);
+
+    if (lsc_variant_room(r, ctx->base_key_hex, ctx->key_hex,
+                         lcf->max_variants) != NGX_OK)
+    {
+        return NGX_DECLINED;
+    }
+
+    if (lsc_collect_headers(r, ctx) != NGX_OK) return NGX_DECLINED;
 
     if (lsc_data_path(r->pool, &mcf->path, ctx->key_hex,
                        &ctx->final_data_path) != NGX_OK
@@ -460,38 +609,17 @@ lsc_setup_capture(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx)
         return NGX_DECLINED;
     }
 
-    /* capture host (lowercased for storage) */
-    {
-        ngx_str_t raw = ngx_null_string;
-        if (r->headers_in.host && r->headers_in.host->value.len > 0) {
-            raw = r->headers_in.host->value;
-        } else if (r->headers_in.server.len > 0) {
-            raw = r->headers_in.server;
-        }
-        if (raw.len > 0 && raw.len <= 255) {
-            u_char *lh = ngx_pnalloc(r->pool, raw.len);
-            if (lh) {
-                ngx_uint_t i;
-                for (i = 0; i < raw.len; i++) lh[i] = ngx_tolower(raw.data[i]);
-                ctx->host.data = lh;
-                ctx->host.len  = raw.len;
-            }
-        }
-    }
-
     /* register cleanup before the open so we never leak a tmp on error */
-    cln = ngx_pool_cleanup_add(r->pool, sizeof(lsc_tmp_cleanup_t));
+    cln = ngx_pool_cleanup_add(r->pool, sizeof(ngx_http_lsc_ctx_t *));
     if (cln == NULL) return NGX_DECLINED;
     cln->handler = lsc_tmp_cleanup;
-    cln_data = cln->data;
-    cln_data->fd   = NGX_INVALID_FILE;
-    cln_data->path = NULL;
+    *(ngx_http_lsc_ctx_t **) cln->data = ctx;
 
     if (lsc_open_tmp(r, &ctx->tmp_fd, &ctx->tmp_path) != NGX_OK) {
+        ctx->tmp_fd   = NGX_INVALID_FILE;
+        ctx->tmp_path = NULL;
         return NGX_DECLINED;
     }
-    cln_data->fd   = ctx->tmp_fd;
-    cln_data->path = ctx->tmp_path;
 
     /* write 24-byte placeholder header */
     {
@@ -508,63 +636,64 @@ lsc_setup_capture(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx)
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * After a successful rename(2), write the .meta sidecar and back-reference
- * empty files (hosts/, tags/, vary/).
- *
- * Best-effort; failures here only mean the entry can't be located by some
- * purge selectors. The data file is still usable for direct-key lookups.
+ * Write the .meta sidecar. Runs BEFORE the data file is renamed into
+ * place, so a servable data file always has its meta. NGX_OK or
+ * NGX_ERROR (the entry must then not be stored).
  * ═══════════════════════════════════════════════════════════════════════ */
 
-static void
-lsc_write_meta_and_refs(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx)
+static ngx_int_t
+lsc_write_meta(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx)
 {
-    ngx_http_lsc_main_conf_t *mcf;
     u_char                   *buf, *p;
     size_t                    bufsz;
     ngx_fd_t                  fd;
-    ngx_uint_t                i;
-    ngx_str_t                 path;
+    ngx_uint_t                i, k;
+    ngx_str_t                 bk, ct;
+    u_char                    meta_tmp[LSC_PATH_MAX];
+    u_char                   *mp;
 
-    mcf = ngx_http_get_module_main_conf(r, ngx_http_lscache_module);
+    ct = r->headers_out.content_type;
+    if (ct.len > LSC_CONTENT_TYPE_MAX) return NGX_ERROR;
+    for (k = 0; k < ct.len; k++) {
+        if (ct.data[k] == '\r' || ct.data[k] == '\n' || ct.data[k] == '\0') {
+            return NGX_ERROR;
+        }
+    }
 
-    /* ---- meta sidecar ---- */
-    bufsz = 1024
-          + (r->headers_out.content_type.len)
+    /* every variable part is counted; the fixed words and numbers fit
+     * in the 512 with room to spare */
+    bufsz = 512
+          + ct.len
           + ctx->lsc_cookie.len
           + ctx->host.len
-          + LSC_MAX_TAGS * (LSC_MAX_TAG_LEN + 8);
+          + ctx->vary_directive.len
+          + ctx->hdr_block.len;
+    for (i = 0; i < ctx->ntags; i++) bufsz += ctx->tags[i].len + 8;
+    if (bufsz > LSC_META_MAX) return NGX_ERROR;
+
     buf = ngx_pnalloc(r->pool, bufsz);
-    if (buf == NULL) return;
+    if (buf == NULL) return NGX_ERROR;
 
     p = buf;
-    p = ngx_sprintf(p, "version 1\n");
-    p = ngx_sprintf(p, "status %ui\n", (ngx_uint_t)r->headers_out.status);
+    p = ngx_sprintf(p, "version 2\n");
+    p = ngx_sprintf(p, "status %ui\n", ctx->resp_status);
     p = ngx_sprintf(p, "expires %T\n", (time_t)(ngx_time() + ctx->max_age));
     p = ngx_sprintf(p, "is_private %d\n", ctx->is_private ? 1 : 0);
-    {
-        ngx_str_t bk;
-        bk.data = ctx->base_key_hex;
-        bk.len  = LSC_KEY_HEX_LEN;
-        p = ngx_sprintf(p, "base %V\n", &bk);
-    }
-
-    if (ctx->host.len > 0) {
-        p = ngx_sprintf(p, "host %V\n", &ctx->host);
-    }
-    if (r->headers_out.content_type.len > 0) {
-        p = ngx_sprintf(p, "content-type %V\n",
-                         &r->headers_out.content_type);
+    bk.data = ctx->base_key_hex;
+    bk.len  = LSC_KEY_HEX_LEN;
+    p = ngx_sprintf(p, "base %V\n", &bk);
+    p = ngx_sprintf(p, "host %V\n", &ctx->host);
+    if (ct.len > 0) {
+        p = ngx_sprintf(p, "content-type %V\n", &ct);
     }
     if (ctx->has_lsc_cookie && ctx->lsc_cookie.len > 0) {
         p = ngx_sprintf(p, "lsc_cookie %V\n", &ctx->lsc_cookie);
     }
     if (ctx->vary_directive.len > 0) {
-        /* sanitize: ASCII printable, drop newlines (single-line record) */
-        ngx_uint_t k;
         p = ngx_cpymem(p, "vary_directive ", 15);
         for (k = 0; k < ctx->vary_directive.len; k++) {
             u_char c = ctx->vary_directive.data[k];
-            if (c == '\n' || c == '\r') c = ' ';
+            if (c == '\n' || c == '\r' || c == '\0') c = ' ';
             *p++ = c;
         }
         *p++ = '\n';
@@ -572,100 +701,87 @@ lsc_write_meta_and_refs(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx)
     for (i = 0; i < ctx->ntags; i++) {
         p = ngx_sprintf(p, "tag %V\n", &ctx->tags[i]);
     }
-
-    /* write meta to a separate tmp, then rename for atomicity */
-    {
-        u_char  meta_tmp[LSC_PATH_MAX];
-        u_char *mp = meta_tmp;
-        if (ctx->final_meta_path.len + 5 >= sizeof(meta_tmp)) return;
-        mp = ngx_cpymem(mp, ctx->final_meta_path.data,
-                          ctx->final_meta_path.len);
-        mp = ngx_cpymem(mp, ".tmp", 4);
-        *mp = '\0';
-
-        fd = ngx_open_file(meta_tmp, NGX_FILE_WRONLY,
-                            NGX_FILE_CREATE_OR_OPEN | NGX_FILE_TRUNCATE,
-                            0640);
-        if (fd == NGX_INVALID_FILE) return;
-        if (ngx_write_fd(fd, buf, p - buf) != (ssize_t)(p - buf)) {
-            ngx_close_file(fd);
-            (void) ngx_delete_file(meta_tmp);
-            return;
-        }
-        ngx_close_file(fd);
-        if (ngx_rename_file(meta_tmp, ctx->final_meta_path.data) != 0) {
-            (void) ngx_delete_file(meta_tmp);
-        }
+    if (ctx->hdr_block.len > 0) {
+        p = ngx_cpymem(p, ctx->hdr_block.data, ctx->hdr_block.len);
+    }
+    if ((size_t) (p - buf) > bufsz) {
+        /* cannot happen; if the sum above is ever wrong, stop here
+         * loudly instead of going on with a damaged heap */
+        ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+            "lscache: meta buffer overrun");
+        ngx_abort();
     }
 
-    /* ---- back-references (best-effort, empty marker files) ---- */
-    if (ctx->host.len > 0) {
-        if (lsc_safe_name(&ctx->host) == NGX_OK
-            && lsc_host_path(r->pool, &mcf->path, &ctx->host, ctx->key_hex,
-                              &path) == NGX_OK)
-        {
-            u_char  parent[LSC_PATH_MAX];
-            u_char *slash;
-            if (path.len < sizeof(parent)) {
-                ngx_memcpy(parent, path.data, path.len);
-                parent[path.len] = '\0';
-                slash = parent + path.len;
-                while (slash > parent && *slash != '/') slash--;
-                if (slash > parent) {
-                    *slash = '\0';
-                    (void) lsc_mkpath(parent, 0750, r->connection->log);
-                }
-            }
-            fd = ngx_open_file(path.data, NGX_FILE_WRONLY,
-                                NGX_FILE_CREATE_OR_OPEN | NGX_FILE_TRUNCATE,
-                                0640);
-            if (fd != NGX_INVALID_FILE) ngx_close_file(fd);
-        }
-    }
-
-    if (lsc_vary_path(r->pool, &mcf->path, ctx->base_key_hex,
-                       ctx->key_hex, &path) == NGX_OK)
+    /* the folder of the data file */
     {
         u_char  parent[LSC_PATH_MAX];
         u_char *slash;
-        if (path.len < sizeof(parent)) {
-            ngx_memcpy(parent, path.data, path.len);
-            parent[path.len] = '\0';
-            slash = parent + path.len;
-            while (slash > parent && *slash != '/') slash--;
-            if (slash > parent) {
-                *slash = '\0';
-                (void) lsc_mkpath(parent, 0750, r->connection->log);
-            }
+        if (ctx->final_meta_path.len >= sizeof(parent)) return NGX_ERROR;
+        ngx_memcpy(parent, ctx->final_meta_path.data,
+                   ctx->final_meta_path.len);
+        parent[ctx->final_meta_path.len] = '\0';
+        slash = parent + ctx->final_meta_path.len;
+        while (slash > parent && *slash != '/') slash--;
+        if (slash == parent) return NGX_ERROR;
+        *slash = '\0';
+        if (lsc_mkpath(parent, 0750, r->connection->log) != NGX_OK) {
+            return NGX_ERROR;
         }
-        fd = ngx_open_file(path.data, NGX_FILE_WRONLY,
-                            NGX_FILE_CREATE_OR_OPEN | NGX_FILE_TRUNCATE,
-                            0640);
-        if (fd != NGX_INVALID_FILE) ngx_close_file(fd);
     }
 
+    /* write to a name of our own, then rename: readers see the old
+     * meta or the new one, never a half */
+    if (ctx->final_meta_path.len + 40 >= sizeof(meta_tmp)) return NGX_ERROR;
+    mp = ngx_sprintf(meta_tmp, "%V.%P.%08xD", &ctx->final_meta_path,
+                     ngx_pid, (uint32_t) ngx_random());
+    *mp = '\0';
+
+    fd = open((char *) meta_tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+              0640);
+    if (fd < 0) return NGX_ERROR;
+    if (ngx_write_fd(fd, buf, p - buf) != (ssize_t)(p - buf)) {
+        ngx_close_file(fd);
+        (void) ngx_delete_file(meta_tmp);
+        return NGX_ERROR;
+    }
+    ngx_close_file(fd);
+    if (ngx_rename_file(meta_tmp, ctx->final_meta_path.data) != 0) {
+        (void) ngx_delete_file(meta_tmp);
+        return NGX_ERROR;
+    }
+    return NGX_OK;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Index markers (hosts/, vary/, tags/): empty files that let a purge
+ * find the entry. Written before the data file too: an entry that can
+ * be served can always be purged.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static void
+lsc_write_refs(ngx_http_request_t *r, ngx_http_lsc_ctx_t *ctx)
+{
+    ngx_http_lsc_main_conf_t *mcf;
+    ngx_uint_t                i;
+    ngx_str_t                 path;
+
+    mcf = ngx_http_get_module_main_conf(r, ngx_http_lscache_module);
+
+    if (lsc_host_path(r->pool, &mcf->path, &ctx->host, ctx->key_hex,
+                      &path) == NGX_OK)
+    {
+        (void) lsc_touch_ref(path.data, path.len, r->connection->log);
+    }
+    if (lsc_vary_path(r->pool, &mcf->path, ctx->base_key_hex,
+                       ctx->key_hex, &path) == NGX_OK)
+    {
+        (void) lsc_touch_ref(path.data, path.len, r->connection->log);
+    }
     for (i = 0; i < ctx->ntags; i++) {
-        if (lsc_safe_name(&ctx->tags[i]) != NGX_OK) continue;
         if (lsc_tag_path(r->pool, &mcf->path, &ctx->tags[i], ctx->key_hex,
                           &path) != NGX_OK) continue;
-        {
-            u_char  parent[LSC_PATH_MAX];
-            u_char *slash;
-            if (path.len < sizeof(parent)) {
-                ngx_memcpy(parent, path.data, path.len);
-                parent[path.len] = '\0';
-                slash = parent + path.len;
-                while (slash > parent && *slash != '/') slash--;
-                if (slash > parent) {
-                    *slash = '\0';
-                    (void) lsc_mkpath(parent, 0750, r->connection->log);
-                }
-            }
-        }
-        fd = ngx_open_file(path.data, NGX_FILE_WRONLY,
-                            NGX_FILE_CREATE_OR_OPEN | NGX_FILE_TRUNCATE,
-                            0640);
-        if (fd != NGX_INVALID_FILE) ngx_close_file(fd);
+        (void) lsc_touch_ref(path.data, path.len, r->connection->log);
     }
 }
 
@@ -718,13 +834,18 @@ lsc_header_filter(ngx_http_request_t *r)
         }
     }
 
-    /* method gate */
-    if      (r->method == NGX_HTTP_GET
-             && (lcf->methods_bitmap & NGX_HTTP_GET))   method_allowed = 1;
-    else if (r->method == NGX_HTTP_HEAD
-             && (lcf->methods_bitmap & NGX_HTTP_HEAD))  method_allowed = 1;
-    else if (r->method == NGX_HTTP_POST
-             && (lcf->methods_bitmap & NGX_HTTP_POST))  method_allowed = 1;
+    /* The status as the backend gave it. Filters below ours may turn
+     * the answer into 304 or 206 for this one client; what is stored
+     * is the full answer. */
+    ctx->resp_status = r->headers_out.status;
+
+    /* method gate: only a GET answer is stored (a HEAD has no body, and
+     * the key has no method in it) */
+    if (r->method == NGX_HTTP_GET
+        && (lcf->methods_bitmap & NGX_HTTP_GET))
+    {
+        method_allowed = 1;
+    }
 
     /* "no upstream caching intent" -> module is idle on this response */
     if (ctx->cc_flags == 0) {
@@ -746,6 +867,19 @@ lsc_header_filter(ngx_http_request_t *r)
         policy_block = 1;
     }
     if (ctx->has_unsafe_vary) policy_block = 1;
+    if (ctx->has_content_encoding) policy_block = 1;
+    /* partial, conditional and interim answers are one client's */
+    if (ctx->resp_status < 200 || ctx->resp_status == 204
+        || ctx->resp_status == 206 || ctx->resp_status == 304)
+    {
+        policy_block = 1;
+    }
+    /* protocol values that do not fit a meta record */
+    if (ctx->vary_directive.len > LSC_VARY_DIRECTIVE_MAX
+        || ctx->lsc_cookie.len > LSC_LSC_COOKIE_MAX)
+    {
+        policy_block = 1;
+    }
     if (ctx->max_age > lcf->max_age) ctx->max_age = lcf->max_age;
 
     if (ctx->cc_flags & LSC_CC_PRIVATE) ctx->is_private = 1;
@@ -767,7 +901,7 @@ lsc_header_filter(ngx_http_request_t *r)
     if (store_intent && lcf->min_uses > 1) {
         ngx_str_t empty = ngx_null_string;
         u_char    base_bin[LSC_KEY_BIN_LEN];
-        lsc_compute_key(r, &empty, &empty, base_bin);
+        lsc_compute_key(r, &empty, &empty, 0, base_bin);
         lsc_hex_encode(base_bin, LSC_KEY_BIN_LEN, ctx->base_key_hex);
         if (lsc_bump_uses(ctx->base_key_hex) < lcf->min_uses) {
             policy_block = 1;
@@ -791,13 +925,11 @@ lsc_header_filter(ngx_http_request_t *r)
 
     /* lscache_debug headers (never enable in production) */
     if (lcf->debug && ctx->key_hex[0] != 0) {
-        ngx_table_elt_t *dh = ngx_list_push(&r->headers_out.headers);
-        if (dh) {
-            dh->hash = 1;
-            ngx_str_set(&dh->key, "X-LSCache-Debug-Key");
-            dh->value.data = ctx->key_hex;
-            dh->value.len  = LSC_KEY_HEX_LEN;
-        }
+        ngx_str_t dv;
+        dv.data = ctx->key_hex;
+        dv.len  = LSC_KEY_HEX_LEN;
+        (void) lsc_push_header(r, "X-LSCache-Debug-Key",
+                               sizeof("X-LSCache-Debug-Key") - 1, &dv);
         if (ctx->vary_directive.len > 0) {
             /* sanitize: vary_directive is upstream-controlled; CR/LF in
              * the value would split the response and inject arbitrary
@@ -810,13 +942,11 @@ lsc_header_filter(ngx_http_request_t *r)
                     if (c < 0x20 || c == 0x7F) c = ' ';
                     safe[k] = c;
                 }
-                dh = ngx_list_push(&r->headers_out.headers);
-                if (dh) {
-                    dh->hash = 1;
-                    ngx_str_set(&dh->key, "X-LSCache-Debug-Vary");
-                    dh->value.data = safe;
-                    dh->value.len  = ctx->vary_directive.len;
-                }
+                dv.data = safe;
+                dv.len  = ctx->vary_directive.len;
+                (void) lsc_push_header(r, "X-LSCache-Debug-Vary",
+                                       sizeof("X-LSCache-Debug-Vary") - 1,
+                                       &dv);
             }
         }
     }
@@ -910,12 +1040,12 @@ lsc_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     if (!last_buf) return next_body_filter(r, in);
 
     /* finalize: rewrite the 24-byte header with real lengths/status/flags,
-     * fsync, atomic rename(2), then write the meta sidecar + back-refs. */
+     * then meta, index markers and the atomic rename(2) of the data. */
     {
         u_char   hdr[24];
         uint32_t body_len = (uint32_t)ctx->bytes_written;
         uint64_t expires  = (uint64_t)(ngx_time() + ctx->max_age);
-        uint16_t status   = (uint16_t)r->headers_out.status;
+        uint16_t status   = (uint16_t)ctx->resp_status;
         uint16_t flags    = 0;
 
         if (ctx->is_private)       flags |= LSC_FF_PRIVATE;
@@ -950,23 +1080,39 @@ lsc_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             return next_body_filter(r, in);
         }
 
-#if !(NGX_WIN32)
-        (void) fsync(ctx->tmp_fd);
-#endif
+        /* No fsync: the cache can be rebuilt, and a file a crash left
+         * short fails the size check on the way out. */
         ngx_close_file(ctx->tmp_fd);
         ctx->tmp_fd = NGX_INVALID_FILE;
+        ctx->capturing = 0;
 
-        if (lsc_finalize_tmp(r, ctx->tmp_path, &ctx->final_data_path)
-            != NGX_OK)
-        {
+        /* meta and index markers first, the data file last: whatever
+         * can be served has its headers and can be found by a purge */
+        if (lsc_write_meta(r, ctx) != NGX_OK) {
             (void) ngx_delete_file(ctx->tmp_path);
             ctx->tmp_path = NULL;
-            ctx->capturing = 0;
         } else {
-            ctx->finalized = 1;
-            ctx->tmp_path  = NULL;     /* rename consumed it */
-            lsc_write_meta_and_refs(r, ctx);
-            lsc_maybe_evict(r);
+            struct stat old;
+            off_t       old_size = 0;
+
+            lsc_write_refs(r, ctx);
+            if (stat((char *) ctx->final_data_path.data, &old) == 0) {
+                old_size = old.st_size;
+            }
+            if (lsc_finalize_tmp(r, ctx->tmp_path, &ctx->final_data_path)
+                != NGX_OK)
+            {
+                (void) ngx_delete_file(ctx->tmp_path);
+                ctx->tmp_path = NULL;
+                /* take back the meta and the markers written above */
+                (void) lsc_unlink_entry(r, ctx->key_hex, -1, NULL);
+            } else {
+                ctx->finalized = 1;
+                ctx->tmp_path  = NULL;     /* rename consumed it */
+                lsc_account(r, (off_t) LSC_FILE_HEADER_BYTES
+                               + ctx->bytes_written - old_size);
+                lsc_maintain(r);
+            }
         }
     }
 
